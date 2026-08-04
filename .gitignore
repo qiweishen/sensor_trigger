@@ -1,0 +1,7 @@
+*.idea/
+*.vscode/
+*.claude/
+*.DS_Store
+
+.pio/
+/logs/
