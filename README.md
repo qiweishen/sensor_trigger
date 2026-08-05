@@ -102,7 +102,7 @@ One reader per port — don't run a recorder and `pio device monitor` together.
 
 ## Hardware
 
-![Teensy 4.1 ↔ FX10e trigger wiring](resource/teensy_fx10e_trigger_wiring.svg)
+![Teensy 4.1 ↔ FX10e trigger wiring](./resource/teensy_fx10e_trigger_wiring.svg)
 
 | Signal | Teensy pin | Notes |
 |---|---|---|
