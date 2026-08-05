@@ -36,6 +36,7 @@ namespace channels {
 	static TrigState g_trig[TRIG_MAX];
 	static volatile bool g_enabled = false;
 	static uint64_t g_margin_ticks = 0;
+	static double g_freq_eff[TRIG_MAX] = { 0 };	 // effective rate (0 = disabled)
 
 
 	// ---------------------------------------------------------------------------
@@ -260,60 +261,89 @@ namespace channels {
 	}
 
 
+	// Validate + program period/width/phase for channel i at `hz`. Warns loudly and
+	// returns false on reject, leaving the old timing intact. hz <= 0 = silent off.
+	// Rules: freq >= 1 Hz (whole-tick period), period >= 4*margin (armRise safety),
+	// phase >= 0 (stagger, folded modulo the period).
+	static bool configFreq(const uint8_t i, const double hz) {
+		const double nom = timebase::nominalHz();
+		const TriggerCfg &c = TRIG_CFG[i];
+		if (hz <= 0.0) {
+			return false;  // configured off, not an error
+		}
+		if (hz < 1.0) {
+			Serial.printf("# !! WARNING: trig[%u] %s freq=%.4fHz < 1 Hz unsupported; channel DISABLED\n", i, c.name, hz);
+			return false;
+		}
+		// floor of 2 keeps the bound meaningful even if margin truncates to 0
+		// (possible at very low tick rates via TB_PRESCALER)
+		const uint64_t min_period = (g_margin_ticks * 4 > 2) ? g_margin_ticks * 4 : 2;
+		const auto period = static_cast<uint64_t>(llround(nom / hz));
+		if (period < min_period) {
+			Serial.printf("# !! WARNING: trig[%u] %s freq=%.4fHz too fast (period < %llu ticks); channel DISABLED\n", i, c.name, hz,
+						  static_cast<unsigned long long>(min_period));
+			return false;
+		}
+		if (c.phase_s < 0.0) {
+			Serial.printf("# !! WARNING: trig[%u] %s phase_s=%.4f < 0 unsupported; channel DISABLED\n", i, c.name, c.phase_s);
+			return false;
+		}
+		g_trig[i].period_ticks = period;
+		g_trig[i].width_ticks = static_cast<uint64_t>(c.pulse_us * 1e-6 * nom);
+		if (g_trig[i].width_ticks < g_margin_ticks) {
+			// must outlast the ISR path to the fall
+			Serial.printf("# !! WARNING: trig[%u] %s pulse widened %lluus -> %.1fus (ISR margin)\n", i, c.name,
+						  (unsigned long long) c.pulse_us, g_margin_ticks * 1e6 / nom);
+			g_trig[i].width_ticks = g_margin_ticks;
+		}
+		if (g_trig[i].width_ticks >= period) {
+			// keep the fall before the next rise
+			Serial.printf("# !! WARNING: trig[%u] %s pulse %lluus >= period; clamped to period/2\n", i, c.name,
+						  (unsigned long long) c.pulse_us);
+			g_trig[i].width_ticks = period / 2;
+		}
+		// fold keeps rise targets < 2^31 ticks ahead, which armCompare relies on
+		g_trig[i].phase_ticks = static_cast<uint64_t>(c.phase_s * nom) % period;
+		return true;
+	}
+
+
+	// Runtime rate change (host START option). Only while disabled; the caller
+	// re-enables and the new period takes effect from the session start.
+	bool setFreqHz(const uint8_t ch, const double hz) {
+		if (ch >= TRIG_MAX || g_enabled) {
+			return false;
+		}
+		if (hz <= 0.0) {  // deliberate off
+			g_trig[ch].cfg_ok = false;
+			g_freq_eff[ch] = 0.0;
+			return true;
+		}
+		if (!configFreq(ch, hz)) {
+			return false;  // rejected: old rate kept
+		}
+		g_trig[ch].cfg_ok = true;
+		g_freq_eff[ch] = hz;
+		return true;
+	}
+
+	double freqHz(const uint8_t ch) {
+		return ch < TRIG_MAX ? g_freq_eff[ch] : 0.0;
+	}
+
+
 	void begin() {
 		const double nom = timebase::nominalHz();
 		g_margin_ticks = static_cast<uint64_t>(nom * 5e-6);	 // 5 us
 
 		for (uint8_t i = 0; i < TRIG_MAX; i++) {
-			const TriggerCfg &c = TRIG_CFG[i];
 			memset(&g_trig[i], 0, sizeof(TrigState));
 			g_trig_seq[i] = 0;
 			g_skipped[i] = 0;
 			g_stalled[i] = 0;
-
-			// reject bad configs loudly + disable, never misbehave silently:
-			//   freq >= 1 Hz          (period is a whole tick count)
-			//   period >= 4*margin    (upper freq bound; keeps armRise retries safe)
-			//   phase >= 0            (stagger only; folded modulo the period)
-			bool ok = (c.freq_hz >= 1.0);
-			if (c.freq_hz > 0.0 && !ok) {
-				Serial.printf("# !! WARNING: trig[%u] %s freq=%.4fHz < 1 Hz unsupported; channel DISABLED\n", i, c.name, c.freq_hz);
-			}
-			if (ok) {
-				// floor of 2 keeps the bound meaningful even if margin truncates to 0
-				// (possible at very low tick rates via TB_PRESCALER)
-				const uint64_t min_period = (g_margin_ticks * 4 > 2) ? g_margin_ticks * 4 : 2;
-				g_trig[i].period_ticks = static_cast<uint64_t>(llround(nom / c.freq_hz));
-				if (g_trig[i].period_ticks < min_period) {
-					Serial.printf("# !! WARNING: trig[%u] %s freq=%.4fHz too fast (period < %llu ticks); channel DISABLED\n", i,
-								  c.name, c.freq_hz, static_cast<unsigned long long>(min_period));
-					ok = false;
-				}
-			}
-			if (ok && c.phase_s < 0.0) {
-				Serial.printf("# !! WARNING: trig[%u] %s phase_s=%.4f < 0 unsupported; channel DISABLED\n", i, c.name, c.phase_s);
-				ok = false;
-			}
-			g_trig[i].cfg_ok = ok;
-			if (ok) {
-				g_trig[i].width_ticks = static_cast<uint64_t>(c.pulse_us * 1e-6 * nom);
-				if (g_trig[i].width_ticks < g_margin_ticks) {
-					// must outlast the ISR path to the fall
-					Serial.printf("# !! WARNING: trig[%u] %s pulse widened %lluus -> %.1fus (ISR margin)\n", i, c.name,
-								  (unsigned long long) c.pulse_us, g_margin_ticks * 1e6 / nom);
-					g_trig[i].width_ticks = g_margin_ticks;
-				}
-				if (g_trig[i].width_ticks >= g_trig[i].period_ticks) {
-					// keep the fall before the next rise
-					Serial.printf("# !! WARNING: trig[%u] %s pulse %lluus >= period; clamped to period/2\n", i, c.name,
-								  (unsigned long long) c.pulse_us);
-					g_trig[i].width_ticks = g_trig[i].period_ticks / 2;
-				}
-				// stagger is meaningful only modulo the period; the fold also keeps
-				// rise targets < 2^31 ticks ahead, which armCompare relies on
-				g_trig[i].phase_ticks = static_cast<uint64_t>(c.phase_s * nom) % g_trig[i].period_ticks;
-			}
-			pinMode(c.pin, OUTPUT);
+			g_trig[i].cfg_ok = configFreq(i, TRIG_CFG[i].freq_hz);
+			g_freq_eff[i] = g_trig[i].cfg_ok ? TRIG_CFG[i].freq_hz : 0.0;
+			pinMode(TRIG_CFG[i].pin, OUTPUT);
 			setIdle(i);
 		}
 

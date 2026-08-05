@@ -3,10 +3,14 @@
 #
 # Each `start` = one new file logs/session_<YYYYmmdd_HHMMSS>.log, path on stdout.
 #
-#   record_ctl.bash start [outdir]   # begin a session; prints the log path; returns at once
-#   record_ctl.bash stop             # end the current session
-#   record_ctl.bash new  [outdir]    # stop (if any) + start
-#   record_ctl.bash status           # "recording -> <file> (port: ...)" or "idle"
+#   record_ctl.bash start [outdir] [freqspec]  # begin a session; prints the log path
+#   record_ctl.bash stop                       # end the current session
+#   record_ctl.bash new  [outdir] [freqspec]   # stop (if any) + start
+#   record_ctl.bash status                     # "recording -> <file> (port: ...)" or "idle"
+#
+# freqspec = per-channel trigger Hz for this run, e.g. "0:25.5,1:2" (0 = channel
+# off; omitted channels keep config.h rates). Rides in the START command, so a
+# watchdog re-START after a board reboot restores the same rates.
 #
 # Board side: `start` sends "START <file>" (board zeroes all counts and begins),
 # `stop` sends "STOP" (board -> idle, counts cleared). C++ form: session_client.cpp.
@@ -33,11 +37,12 @@ find_port() {
 running_pid() { [ -f "$STATE" ] && head -1 "$STATE" 2>/dev/null; }
 is_running() { local p; p=$(running_pid); [ -n "${p:-}" ] && kill -0 "$p" 2>/dev/null; }
 
-# Background worker (own process group via setsid): capture the port into $1.
-# First connect: send START at once. Watchdog: "#IDLE" in fresh output means the
-# board is not in a session (boot / reboot / lost START) -> (re)send START.
+# Background worker (own process group via setsid): capture the port into $1;
+# $2 = optional freqspec. First connect: send START at once. Watchdog: "#IDLE" in
+# fresh output = board not in a session (boot / reboot / lost START) -> (re)START.
 _worker() {
-	local file="$1" port catpid first=1
+	local file="$1" spec="${2:-}" port catpid first=1 startcmd
+	if [ -n "$spec" ]; then startcmd="START freq=$spec $file"; else startcmd="START $file"; fi
 	while :; do
 		port=$(find_port) || { sleep 1; continue; }
 		stty -F "$port" raw -echo "$BAUD" 2>/dev/null || { sleep 1; continue; }
@@ -45,13 +50,13 @@ _worker() {
 		catpid=$!
 		if [ "$first" = 1 ]; then
 			sleep 0.3
-			printf 'START %s\n' "$file" > "$port" 2>/dev/null
+			printf '%s\n' "$startcmd" > "$port" 2>/dev/null
 			first=0
 		fi
 		while kill -0 "$catpid" 2>/dev/null; do    # until the port drops
 			sleep 6
 			if tail -c 512 "$file" 2>/dev/null | grep -q '#IDLE'; then
-				printf 'START %s\n' "$file" > "$port" 2>/dev/null
+				printf '%s\n' "$startcmd" > "$port" 2>/dev/null
 			fi
 		done
 		wait "$catpid" 2>/dev/null
@@ -60,11 +65,11 @@ _worker() {
 }
 
 start() {
-	local outdir="${1:-./logs}" file pid
+	local outdir="${1:-./logs}" spec="${2:-}" file pid
 	if is_running; then echo "already recording: $(sed -n 2p "$STATE")" >&2; return 1; fi
 	mkdir -p "$outdir"
 	file="$outdir/session_$(date +%Y%m%d_%H%M%S).log"
-	setsid bash "$0" __worker "$file" </dev/null >/dev/null 2>&1 &
+	setsid bash "$0" __worker "$file" "$spec" </dev/null >/dev/null 2>&1 &
 	pid=$!
 	printf '%s\n%s\n' "$pid" "$file" > "$STATE"
 	echo "$file"                              # driver reads this: the session's log path
@@ -98,10 +103,10 @@ status() {
 }
 
 case "${1:-}" in
-	__worker) shift; _worker "$1" ;;                       # internal
+	__worker) shift; _worker "$1" "${2:-}" ;;              # internal
 	start)    shift; start "$@" ;;
 	stop)     stop ;;
 	new)      shift; stop >/dev/null 2>&1; sleep 0.3; start "$@" ;;
 	status)   status ;;
-	*) echo "usage: $0 {start [outdir] | stop | new [outdir] | status}" >&2; exit 2 ;;
+	*) echo "usage: $0 {start [outdir] [freqspec] | stop | new [outdir] [freqspec] | status}" >&2; exit 2 ;;
 esac

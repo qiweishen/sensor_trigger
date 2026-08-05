@@ -29,7 +29,7 @@
 // Session state: idle after boot; logs only between START and STOP.
 // START zeroes all counters -> every stream counts from 0 per session.
 static volatile bool g_running = false;
-static char g_session_path[128] = { 0 };  // >= max cmd payload; no truncation
+static char g_session_path[224] = { 0 };  // >= max cmd payload; no truncation
 
 
 // ---------------------------------------------------------------------------
@@ -128,7 +128,8 @@ static void printHeader() {
 	Serial.printf("#LOG,SensorSync-logger,1,tick_hz=%.3f\n", timebase::nominalHz());
 #endif
 	for (uint8_t i = 0; i < TRIG_MAX; i++) {
-		Serial.printf("#TRIG,%u,%s,%u,%.4f,ah=%u\n", i, TRIG_CFG[i].name, TRIG_CFG[i].pin, TRIG_CFG[i].freq_hz,
+		// effective rate: config.h default, or the session's freq= override
+		Serial.printf("#TRIG,%u,%s,%u,%.4f,ah=%u\n", i, TRIG_CFG[i].name, TRIG_CFG[i].pin, channels::freqHz(i),
 					  TRIG_CFG[i].active_high ? 1 : 0);
 	}
 	for (uint8_t i = 0; i < STROBE_MAX; i++) {
@@ -195,15 +196,17 @@ static void drainAll(uint32_t deadline_ms) {
 
 // ---------------------------------------------------------------------------
 // Session control (host-facing API).
-//   START [path]  zero all counts, enable capture, emit #SESSION,START + header
+//   START [freq=<ch>:<hz>,...] [path]   zero all counts, optionally retune
+//                 trigger rates, enable capture, emit #SESSION,START + header
 //   STOP          drain tail, emit #SESSION,STOP, park idle, clear counts
 // <path> is echo only (board cannot write the host filesystem); it makes the
-// log self-document where the host saved it.
+// log self-document where the host saved it. freq= overrides persist until the
+// next override or reboot; the #TRIG header always shows the effective rate.
 static void closeRunningSession() {
 	g_running = false;
 	channels::setEnabled(false);
 	drainAll(500);	// flush the session tail before the marker
-	if (waitTx(kLineMax, 250)) {
+	if (waitTx(512, 250)) {	 // marker line can exceed kLineMax (long path)
 		Serial.printf("#SESSION,STOP,%s\n", g_session_path);
 	}
 	// all-zero while idle; next START counts from 0
@@ -224,7 +227,30 @@ static void stopSession() {
 }
 
 
-static void startSession(const char *path) {
+// Apply a "freq=" START option: "<ch>:<hz>[,<ch>:<hz>...]", hz 0 = channel off.
+// Invalid items answer #ERR and keep the old rate; the header shows the truth.
+static void applyFreqSpec(char *spec) {
+	for (char *tok = strtok(spec, ","); tok; tok = strtok(nullptr, ",")) {
+		bool ok = false;
+		char *colon = strchr(tok, ':');
+		if (colon) {
+			*colon = 0;
+			char *e1 = nullptr;
+			char *e2 = nullptr;
+			const long ch = strtol(tok, &e1, 10);
+			const double hz = strtod(colon + 1, &e2);
+			ok = e1 && *e1 == 0 && e1 != tok && e2 && *e2 == 0 && e2 != colon + 1 && ch >= 0 && ch < TRIG_MAX &&
+				 channels::setFreqHz(static_cast<uint8_t>(ch), hz);
+			*colon = ':';  // restore for the error echo
+		}
+		if (!ok && Serial.availableForWrite() >= kLineMax) {
+			Serial.printf("#ERR,bad_freq,%s\n", tok);
+		}
+	}
+}
+
+
+static void startSession(const char *path, char *freqspec = nullptr) {
 	if (g_running) {
 		closeRunningSession();	// paired STOP marker for the old session
 	}
@@ -232,11 +258,14 @@ static void startSession(const char *path) {
 	timesync::resetStats();
 	channels::resetCounts();
 	g_host_drops = 0;
+	if (freqspec) {
+		applyFreqSpec(freqspec);  // while disabled; new rates land in the header below
+	}
 
 	// announce, header first so no data line precedes it
 	strncpy(g_session_path, path ? path : "", sizeof(g_session_path) - 1);
 	g_session_path[sizeof(g_session_path) - 1] = 0;
-	if (waitTx(kLineMax, 250)) {
+	if (waitTx(512, 250)) {	 // marker line can exceed kLineMax (long path)
 		Serial.printf("#SESSION,START,%s\n", g_session_path);
 	}
 	printHeader();
@@ -256,11 +285,29 @@ static void handleCommand(char *s) {
 	}
 	const auto boundary = [](char c) { return c == '\0' || c == ' ' || c == '\t'; };
 	if (strncmp(s, "START", 5) == 0 && boundary(s[5])) {
-		const char *p = s + 5;
+		char *p = s + 5;
 		while (*p == ' ' || *p == '\t') {
 			p++;
 		}
-		startSession(p);
+		// optional leading option: "freq=<ch>:<hz>[,...]", then the path
+		char *freq = nullptr;
+		if (strncmp(p, "freq=", 5) == 0) {
+			freq = p + 5;
+			char *sp = freq;
+			while (*sp && *sp != ' ' && *sp != '\t') {
+				sp++;
+			}
+			if (*sp) {
+				*sp = 0;
+				p = sp + 1;
+				while (*p == ' ' || *p == '\t') {
+					p++;
+				}
+			} else {
+				p = sp;	 // freq only, empty path
+			}
+		}
+		startSession(p, freq);
 	} else if (strncmp(s, "STOP", 4) == 0 && boundary(s[4])) {
 		stopSession();
 	} else if (strcmp(s, "s") == 0 || strcmp(s, "STATUS") == 0) {
@@ -309,7 +356,7 @@ void setup() {
 	channels::begin();
 
 	// boot idle: triggers off, nothing counted, until START
-	Serial.println("# SensorSync-logger ready (idle). commands: START [path] | STOP | s (status) | h (header)");
+	Serial.println("# SensorSync-logger ready (idle). commands: START [freq=ch:hz,...] [path] | STOP | s (status) | h (header)");
 }
 
 // ---------------------------------------------------------------------------
@@ -356,8 +403,9 @@ void loop() {
 	}
 
 	// command input: accumulate to newline, then dispatch
-	static char cmd[128];
-	static uint8_t cmdlen = 0;
+	// (256: "START freq=... " + a long absolute log path must fit untruncated)
+	static char cmd[256];
+	static uint16_t cmdlen = 0;
 	while (Serial.available()) {
 		const char c = static_cast<char>(Serial.read());
 		if (c == '\n' || c == '\r') {

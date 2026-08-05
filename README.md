@@ -56,12 +56,14 @@ The board **boots idle** and logs nothing until told to start. One session = one
 
 | Command | Action |
 |---|---|
-| `START [path]` | zero every counter, enable triggers + capture, emit `#SESSION,START` + header, stream data. A `START` during a run first closes it with a paired `#SESSION,STOP`. |
+| `START [freq=CH:HZ,...] [path]` | zero every counter, optionally retune trigger rates, enable triggers + capture, emit `#SESSION,START` + header, stream data. A `START` during a run first closes it with a paired `#SESSION,STOP`. |
 | `STOP` | drain queued events, emit `#SESSION,STOP`, park idle, clear counts. Idle `STOP` just answers `#IDLE`. |
 | `s` (or `STATUS`) | `#H` health if running, else `#IDLE` |
 | `h` (or `HEADER`) | reprint the `#LOG/#TRIG/#STROBE` header |
 
 `<path>` is **echo-only** — the board cannot write the host filesystem; the *host* saves the stream. Keywords are token-matched, so a garbled line (`STOPPED`, `STARTx`) cannot toggle session state.
+
+**Per-run trigger rates** — exposure time is only known in the field, so the fitting trigger frequency is a `START` option, not a rebuild: `START freq=0:25.5,2:0 /data/run7.log` retunes trig[0] to 25.5 Hz and switches trig[2] off; omitted channels keep their `config.h` rates. Overrides persist until the next override or reboot, the `#TRIG` header always echoes the **effective** rates (verify there), and an invalid entry answers `#ERR,bad_freq,...` while keeping the old rate. Because the rates ride inside `START`, a watchdog re-`START` after a board reboot restores them automatically.
 
 ### Drive it from your acquisition program
 
@@ -70,19 +72,20 @@ The board **boots idle** and logs nothing until told to start. One session = one
 ```cpp
 SensorSyncSession s;
 s.open("/dev/serial/by-id/usb-Teensyduino_...");  // by-id survives re-enumeration
-s.start("/data/logs/run_0007.log");   // one file per run, counts from 0
+s.start("/data/logs/run_0007.log",    // one file per run, counts from 0
+        {{0, 25.0}, {1, 2.0}});       // field-decided trigger Hz ({ch,0} = off; optional)
 // ... acquisition ...
 s.stop();                             // board -> idle
 ```
 
 Mid-run recovery is built in: if the port drops (USB glitch or board reboot) the reader re-opens it and keeps appending to the same file, and a watchdog that sees `#IDLE` in the stream re-sends `START` (rate-limited, muted during `stop()`) — so a rebooted board resumes as a second `#SESSION,START` in the same file, which `postprocess.py` splits.
 
-Demo build: `g++ -std=c++17 -O2 -pthread -DSESSION_CLIENT_DEMO session_client.cpp -o session_client`, then `./session_client /dev/ttyACM0 /tmp/run.log 5`.
+Demo build: `g++ -std=c++17 -O2 -pthread -DSESSION_CLIENT_DEMO session_client.cpp -o session_client`, then `./session_client /dev/ttyACM0 /tmp/run.log 5 25` (last arg = trig[0] Hz, optional).
 
 **Shell / Python** — [`record_ctl.bash`](record_ctl.bash) wraps the same protocol; each `start` creates `logs/session_<timestamp>.log` and prints its path:
 
 ```bash
-LOG=$(./record_ctl.bash start /data/logs)   # begin; path printed on stdout
+LOG=$(./record_ctl.bash start /data/logs 0:25.5)   # begin at 25.5 Hz; path on stdout
 # ... acquisition ...
 ./record_ctl.bash stop
 python3 postprocess.py "$LOG" -o "${LOG%.log}.csv" --gps

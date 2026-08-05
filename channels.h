@@ -26,6 +26,11 @@ namespace channels {
 	void setEnabled(bool on);
 	bool enabled();
 
+	// runtime frequency override (only while disabled). hz <= 0 disables the
+	// channel deliberately; invalid hz is rejected (false) and the old rate kept
+	bool setFreqHz(uint8_t ch, double hz);
+	double freqHz(uint8_t ch);	// effective rate for the header (0 = disabled)
+
 	// zero all counters + empty the rings (next session from 0); only while disabled
 	void resetCounts();
 

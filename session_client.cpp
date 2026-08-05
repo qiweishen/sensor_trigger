@@ -3,9 +3,16 @@
 // Usage from an acquisition driver:
 //     SensorSyncSession s;
 //     s.open("/dev/serial/by-id/usb-Teensyduino_...");   // by-id survives re-enumeration
-//     s.start("/data/logs/run_0007.log");                // one file per run, counts from 0
+//     s.start("/data/logs/run_0007.log",                 // one file per run, counts from 0
+//             {{0, 25.0}, {1, 2.0}});                    // per-channel trigger Hz, decided in the field
 //     ... acquisition ...
 //     s.stop();                                          // board -> idle, counts cleared
+//
+// The freq list is optional; {ch, 0} switches a channel off, omitted channels keep
+// their config.h rate. It rides inside the START command ("START freq=0:25,1:2 <path>"),
+// so a watchdog re-START after a board reboot restores the same rates. The board
+// echoes the EFFECTIVE rates in the "#TRIG" header - verify there, and invalid
+// entries answer "#ERR,bad_freq,..." while keeping the old rate.
 //
 // start() flushes stale input, sends "START <path>", opens <path>, and spawns a
 // reader thread that copies the serial stream into the file until stop().
@@ -20,12 +27,12 @@
 //     file and postprocess.py splits the sessions
 //
 // Protocol (newline-terminated, 115200 8N1 - do not change the baud):
-//   host -> board:  "START [path]" | "STOP" | "s" (status) | "h" (header)
+//   host -> board:  "START [freq=<ch>:<hz>,...] [path]" | "STOP" | "s" (status) | "h" (header)
 //   board -> host:  "#SESSION,START,<path>", header, P/T/S/Z data + "#H" health,
 //                   "#SESSION,STOP,<path>"; "#IDLE,up=<ms>" while idle
 //
 // Build demo:  g++ -std=c++17 -O2 -pthread -DSESSION_CLIENT_DEMO session_client.cpp -o session_client
-// Run demo:    ./session_client /dev/ttyACM0 /tmp/run.log 5
+// Run demo:    ./session_client /dev/ttyACM0 /tmp/run.log 5 25    (trig[0] at 25 Hz)
 
 #include <atomic>
 #include <chrono>
@@ -37,6 +44,8 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include <cerrno>
 #include <fcntl.h>
@@ -60,8 +69,10 @@ public:
 		return openPortLocked();
 	}
 
-	// begin a run: fresh counts from 0, stream captured to `path`
-	bool start(const std::string &path) {
+	// begin a run: fresh counts from 0, stream captured to `path`.
+	// freqs: per-channel trigger rates {ch, hz} decided in the field (exposure
+	// time known -> rate computed); {ch, 0} = channel off; empty = keep defaults
+	bool start(const std::string &path, const std::vector<std::pair<int, double>> &freqs = {}) {
 		if (running_) {
 			return false;
 		}
@@ -70,6 +81,12 @@ public:
 			return false;
 		}
 		session_path_ = path;
+		freq_spec_.clear();
+		for (const auto &f : freqs) {
+			char item[48];
+			snprintf(item, sizeof(item), "%s%d:%g", freq_spec_.empty() ? "" : ",", f.first, f.second);
+			freq_spec_ += item;
+		}
 		{
 			std::lock_guard<std::mutex> lk(io_mtx_);
 			if (fd_ < 0) {
@@ -154,7 +171,12 @@ private:
 	}
 
 	bool sendStartLocked() {
-		const std::string cmd = "START " + session_path_ + "\n";
+		// freq rides in START so a watchdog re-START restores the same rates
+		std::string cmd = "START ";
+		if (!freq_spec_.empty()) {
+			cmd += "freq=" + freq_spec_ + " ";
+		}
+		cmd += session_path_ + "\n";
 		last_start_ = Clock::now();
 		return fd_ >= 0 && ::write(fd_, cmd.data(), cmd.size()) == static_cast<ssize_t>(cmd.size());
 	}
@@ -238,6 +260,7 @@ private:
 
 	std::string port_path_;
 	std::string session_path_;
+	std::string freq_spec_;	 // "0:25,1:2" - per-channel Hz for this run
 	int fd_ = -1;
 	std::ofstream out_;
 	std::thread reader_;
@@ -252,21 +275,25 @@ private:
 
 
 #ifdef SESSION_CLIENT_DEMO
-// demo: ./session_client <port> <logfile> [seconds]
+// demo: ./session_client <port> <logfile> [seconds] [trig0_hz]
 static std::atomic<bool> g_interrupted{ false };
 
 int main(int argc, char **argv) {
 	if (argc < 3) {
-		fprintf(stderr, "usage: %s <port> <logfile> [seconds]\n", argv[0]);
+		fprintf(stderr, "usage: %s <port> <logfile> [seconds] [trig0_hz]\n", argv[0]);
 		return 2;
 	}
 	const int secs = (argc > 3) ? atoi(argv[3]) : 5;
+	std::vector<std::pair<int, double>> freqs;
+	if (argc > 4) {
+		freqs.emplace_back(0, atof(argv[4]));  // field-decided camera rate
+	}
 	SensorSyncSession s;
 	if (!s.open(argv[1])) {
 		fprintf(stderr, "open %s failed\n", argv[1]);
 		return 1;
 	}
-	if (!s.start(argv[2])) {
+	if (!s.start(argv[2], freqs)) {
 		fprintf(stderr, "start failed\n");
 		return 1;
 	}
