@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <iterator>
 
 #include "timebase.h"
 
@@ -30,7 +31,7 @@ namespace channels {
 		uint64_t phase_ticks;
 		uint64_t rise_tick;		 // absolute tick of the current/next rising edge
 		volatile uint8_t stage;	 // 0 = rise scheduled, 1 = fall scheduled
-		bool cfg_ok;			 // freq >= 1 Hz (else channel disabled)
+		bool cfg_ok;			 // config validated in begin() (else channel disabled)
 	};
 	static TrigState g_trig[TRIG_MAX];
 	static volatile bool g_enabled = false;
@@ -38,9 +39,9 @@ namespace channels {
 
 
 	// ---------------------------------------------------------------------------
-	// Event rings. Each has a SINGLE producer context: g_trigq from the GPT1 ISR,
-	// g_strobeq from the GPIO ISR - so both are plain SPSC (no locks). Per-channel
-	// sequence numbers advance even on a drop, so a gap in the log is detectable.
+	// Event rings.
+	// Each has a SINGLE producer context: g_trigq from the GPT1 ISR, g_strobeq from the GPIO ISR - so both are plain SPSC (no locks).
+	// Per-channel sequence numbers advance even on a drop, so a gap in the log is detectable.
 	struct Evt {
 		uint8_t ch;
 		uint8_t level;
@@ -52,6 +53,7 @@ namespace channels {
 	static volatile uint16_t g_trigq_head = 0, g_trigq_tail = 0;
 	static volatile uint32_t g_trig_seq[TRIG_MAX] = { 0 };
 	static volatile uint32_t g_skipped[TRIG_MAX] = { 0 };
+	static volatile uint32_t g_stalled[TRIG_MAX] = { 0 };  // armRise gave up; channel dead until next START
 	static volatile uint32_t g_trig_drops = 0;
 
 	static volatile Evt g_strobeq[EVT_RING_SIZE];
@@ -77,6 +79,9 @@ namespace channels {
 
 
 	static void pushStrobe(const uint8_t ch, const uint8_t level, const uint64_t tick) {
+		if (!g_enabled) {
+			return;	 // idle between sessions: don't count or queue strobe edges
+		}
 		const uint32_t s = ++g_strobe_seq[ch];
 		const uint16_t h = g_strobeq_head;
 		const auto nh = static_cast<uint16_t>((h + 1) % EVT_RING_SIZE);
@@ -133,9 +138,8 @@ namespace channels {
 	}
 
 
-	// Write a 32-bit compare and read back to confirm it is still in the future. With FRR=1
-	// the GPT compares for EQUALITY, so a value that just passed will not match again for a
-	// full 2^32 lap; the read-back makes that visible.
+	// Write a 32-bit compare and read back to confirm it is still in the future.
+	// With FRR=1 the GPT compares for EQUALITY, so a value that just passed will not match again for a full 2^32 lap.
 	static bool armCompare(const uint8_t ch, const uint64_t tick) {
 		*ocrPtr(ch) = static_cast<uint32_t>(tick & 0xFFFFFFFFULL);
 		GPT1_SR = ofFlag(ch);
@@ -145,7 +149,7 @@ namespace channels {
 	}
 
 
-	// Catch rise_tick up to the future (if the ISR fell behind) and arm the rising edge.
+	// Catch rise_tick up to the future (if the ISR fell behind) and arm the rising edge
 	static void armRise(const uint8_t ch) {
 		TrigState &s = g_trig[ch];
 		s.stage = 0;
@@ -160,17 +164,18 @@ namespace channels {
 			if (armCompare(ch, s.rise_tick)) {
 				return;
 			}
-			// Slipped past while writing the OCR: advance one period and retry.
+			// slipped past while writing the OCR: advance one period, retry
 			s.rise_tick += s.period_ticks;
 			g_skipped[ch]++;
 		}
-		GPT1_IR &= ~ofIe(ch);  // give up (should never happen: period >> margin)
+		// give up (unreachable for valid configs: period >= 4*margin makes the
+		// 2nd attempt always land clear). Counted -> visible as stall= in #Ht.
+		GPT1_IR &= ~ofIe(ch);
+		g_stalled[ch]++;
 	}
 
 
-	// GPT1 interrupt (forwarded by timebase). Single pass: the physical edge skew between
-	// two channels that fire in the same ISR is a few microseconds, but every edge is logged
-	// at its EXACT compare tick, so the recorded times are unaffected.
+	// GPT1 interrupt (forwarded by timebase)
 	void gptIsr(const uint32_t sr) {
 		if (!g_enabled) {
 			return;
@@ -191,10 +196,11 @@ namespace channels {
 				pushTrig(i, activeLevel(i), s.rise_tick);
 				s.stage = 1;
 				if (!armCompare(i, s.rise_tick + s.width_ticks)) {
-					// Fall slipped past: a late fall only stretches the pulse, and leaving it
-					// would pin the pin asserted for a full lap - so drop it in software now.
+					// fall slipped past: leaving it would pin the pin asserted for a
+					// full 2^32 lap -> drop in software now, log the ACTUAL fall time
+					// (the scheduled tick would understate the stretched pulse)
 					digitalWriteFast(c.pin, idleLevel(i));
-					pushTrig(i, idleLevel(i), s.rise_tick + s.width_ticks);
+					pushTrig(i, idleLevel(i), timebase::now());
 					s.rise_tick += s.period_ticks;
 					armRise(i);
 				}
@@ -234,6 +240,7 @@ namespace channels {
 		if (on) {
 			GPT1_SR = ofFlag(0) | ofFlag(1) | ofFlag(2);  // drop stale flags
 			g_enabled = true;
+			// 4x margin: covers the arm sequence for all channels before the first compare
 			const uint64_t start = timebase::now() + g_margin_ticks * 4;
 			for (uint8_t i = 0; i < TRIG_MAX; i++) {
 				if (!g_trig[i].cfg_ok) {
@@ -262,27 +269,49 @@ namespace channels {
 			memset(&g_trig[i], 0, sizeof(TrigState));
 			g_trig_seq[i] = 0;
 			g_skipped[i] = 0;
+			g_stalled[i] = 0;
 
-			// Period is a whole number of ticks: freq must be >= 1 Hz (and, to be safe, well
-			// below the tick rate). Reject loudly and disable rather than misbehave silently.
+			// reject bad configs loudly + disable, never misbehave silently:
+			//   freq >= 1 Hz          (period is a whole tick count)
+			//   period >= 4*margin    (upper freq bound; keeps armRise retries safe)
+			//   phase >= 0            (stagger only; folded modulo the period)
 			bool ok = (c.freq_hz >= 1.0);
 			if (c.freq_hz > 0.0 && !ok) {
 				Serial.printf("# !! WARNING: trig[%u] %s freq=%.4fHz < 1 Hz unsupported; channel DISABLED\n", i, c.name, c.freq_hz);
 			}
+			if (ok) {
+				// floor of 2 keeps the bound meaningful even if margin truncates to 0
+				// (possible at very low tick rates via TB_PRESCALER)
+				const uint64_t min_period = (g_margin_ticks * 4 > 2) ? g_margin_ticks * 4 : 2;
+				g_trig[i].period_ticks = static_cast<uint64_t>(llround(nom / c.freq_hz));
+				if (g_trig[i].period_ticks < min_period) {
+					Serial.printf("# !! WARNING: trig[%u] %s freq=%.4fHz too fast (period < %llu ticks); channel DISABLED\n", i,
+								  c.name, c.freq_hz, static_cast<unsigned long long>(min_period));
+					ok = false;
+				}
+			}
+			if (ok && c.phase_s < 0.0) {
+				Serial.printf("# !! WARNING: trig[%u] %s phase_s=%.4f < 0 unsupported; channel DISABLED\n", i, c.name, c.phase_s);
+				ok = false;
+			}
 			g_trig[i].cfg_ok = ok;
 			if (ok) {
-				g_trig[i].period_ticks = static_cast<uint64_t>(llround(nom / c.freq_hz));
-				if (g_trig[i].period_ticks < 2) {
-					g_trig[i].period_ticks = 2;
-				}
 				g_trig[i].width_ticks = static_cast<uint64_t>(c.pulse_us * 1e-6 * nom);
 				if (g_trig[i].width_ticks < g_margin_ticks) {
-					g_trig[i].width_ticks = g_margin_ticks;	 // must outlast the ISR path to the fall
+					// must outlast the ISR path to the fall
+					Serial.printf("# !! WARNING: trig[%u] %s pulse widened %lluus -> %.1fus (ISR margin)\n", i, c.name,
+								  (unsigned long long) c.pulse_us, g_margin_ticks * 1e6 / nom);
+					g_trig[i].width_ticks = g_margin_ticks;
 				}
 				if (g_trig[i].width_ticks >= g_trig[i].period_ticks) {
-					g_trig[i].width_ticks = g_trig[i].period_ticks / 2;	 // keep fall before the next rise
+					// keep the fall before the next rise
+					Serial.printf("# !! WARNING: trig[%u] %s pulse %lluus >= period; clamped to period/2\n", i, c.name,
+								  (unsigned long long) c.pulse_us);
+					g_trig[i].width_ticks = g_trig[i].period_ticks / 2;
 				}
-				g_trig[i].phase_ticks = static_cast<uint64_t>(c.phase_s * nom);
+				// stagger is meaningful only modulo the period; the fold also keeps
+				// rise targets < 2^31 ticks ahead, which armCompare relies on
+				g_trig[i].phase_ticks = static_cast<uint64_t>(c.phase_s * nom) % g_trig[i].period_ticks;
 			}
 			pinMode(c.pin, OUTPUT);
 			setIdle(i);
@@ -300,7 +329,27 @@ namespace channels {
 		// PPS (software mode) shares this vector; keep >= 32 from GPT1 (see config.h).
 		NVIC_SET_PRIORITY(IRQ_GPIO6789, STROBE_IRQ_PRIORITY);
 
-		setEnabled(true);  // start triggering immediately (no lock needed)
+		// Boot idle: no triggers, no strobe capture. A START command begins a session.
+	}
+
+
+	// Zero every per-channel counter and empty the event rings, so the next session counts from 0.
+	// Call only while disabled (no ISR is pushing).
+	void resetCounts() {
+		__disable_irq();
+		for (uint8_t i = 0; i < TRIG_MAX; i++) {
+			g_trig_seq[i] = 0;
+			g_skipped[i] = 0;
+			g_stalled[i] = 0;
+		}
+		for (uint8_t i = 0; i < STROBE_MAX; i++) {
+			g_strobe_seq[i] = 0;
+		}
+		g_trig_drops = 0;
+		g_strobe_drops = 0;
+		g_trigq_head = g_trigq_tail = 0;
+		g_strobeq_head = g_strobeq_tail = 0;
+		__enable_irq();
 	}
 
 
@@ -316,6 +365,9 @@ namespace channels {
 	}
 	uint32_t skippedCount(const uint8_t ch) {
 		return ch < TRIG_MAX ? g_skipped[ch] : 0;
+	}
+	uint32_t stalledCount(const uint8_t ch) {
+		return ch < TRIG_MAX ? g_stalled[ch] : 0;
 	}
 	uint32_t trigDrops() {
 		return g_trig_drops;
