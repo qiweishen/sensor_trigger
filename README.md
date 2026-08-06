@@ -125,9 +125,11 @@ One reader per port — don't run a recorder and `pio device monitor` together.
 [PlatformIO](https://platformio.org/):
 
 ```bash
-pio run                 # build
-pio run -t upload       # flash
+./upload.bash           # one command: build + flash + boot check
+./upload.bash -b        # build only
 ```
+
+`upload.bash` refuses to flash while a recorder holds the port, waits for the board to re-enumerate, and confirms the boot banner. Manual equivalent: `pio run` / `pio run -t upload`.
 
 **Linux:** install the PJRC udev rules or ModemManager will hold the port (`sudo wget -O /etc/udev/rules.d/00-teensy.rules https://www.pjrc.com/teensy/00-teensy.rules && sudo udevadm control --reload-rules && sudo udevadm trigger`, then replug).
 
@@ -210,6 +212,7 @@ Stderr reports: per-stream dropped-edge counts (from seq gaps, including drops b
 | `postprocess.py` | offline pairing + centered fit + per-frame CSV |
 | `session_client.cpp` | C++ session client: `open` / `start` / `stop` + reader thread |
 | `record_ctl.bash` | shell session control: `start` / `stop` / `new` / `status` |
+| `upload.bash` | one-command build + flash + boot check |
 | `resource/` | wiring diagram |
 
 ## License
