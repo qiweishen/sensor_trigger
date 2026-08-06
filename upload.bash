@@ -9,9 +9,19 @@
 set -u
 cd "$(dirname "$0")"
 
-# pio from PATH, else the default PlatformIO install
-PIO=$(command -v pio || echo "$HOME/.platformio/penv/bin/pio")
-[ -x "$PIO" ] || { echo "!! pio not found - install PlatformIO first" >&2; exit 1; }
+# pio from PATH, else the default PlatformIO / pip --user install locations
+PIO=$(command -v pio || true)
+[ -n "$PIO" ] || for p in "$HOME/.platformio/penv/bin/pio" "$HOME/.local/bin/pio"; do
+	[ -x "$p" ] && { PIO="$p"; break; }
+done
+[ -n "$PIO" ] && [ -x "$PIO" ] || {
+	echo "!! pio not found - install with:  python3 -m pip install --user platformio" >&2
+	exit 1
+}
+
+# headless (edge device / ssh): the default teensy-gui loader needs a display
+ENVOPT=()
+[ -z "${DISPLAY:-}" ] && ENVOPT=(-e teensy41_cli)
 
 find_port() {
 	local p
@@ -21,7 +31,7 @@ find_port() {
 }
 
 if [ "${1:-}" = "-b" ]; then
-	exec "$PIO" run
+	exec "$PIO" run "${ENVOPT[@]}"
 fi
 
 # a live reader (record_ctl worker / pio monitor) blocks clean re-enumeration
@@ -30,7 +40,7 @@ port=$(find_port) && fuser -s "$port" 2>/dev/null && {
 	exit 1
 }
 
-"$PIO" run -t upload || exit 1
+"$PIO" run "${ENVOPT[@]}" -t upload || exit 1
 
 # boot check: wait for re-enumeration, then for the ready banner / first heartbeat
 printf 'waiting for the board to come back'

@@ -129,9 +129,11 @@ One reader per port — don't run a recorder and `pio device monitor` together.
 ./upload.bash -b        # build only
 ```
 
-`upload.bash` refuses to flash while a recorder holds the port, waits for the board to re-enumerate, and confirms the boot banner. Manual equivalent: `pio run` / `pio run -t upload`.
+`upload.bash` refuses to flash while a recorder holds the port, waits for the board to re-enumerate, and confirms the boot banner. On a headless machine (edge device / ssh, no `$DISPLAY`) it automatically switches to the `teensy-cli` loader. Manual equivalent: `pio run` / `pio run -t upload`.
 
-**Linux:** install the PJRC udev rules or ModemManager will hold the port (`sudo wget -O /etc/udev/rules.d/00-teensy.rules https://www.pjrc.com/teensy/00-teensy.rules && sudo udevadm control --reload-rules && sudo udevadm trigger`, then replug).
+**Linux:** install the PJRC udev rules or ModemManager will hold the port (`sudo wget -O /etc/udev/rules.d/00-teensy.rules https://www.pjrc.com/teensy/00-teensy.rules && sudo udevadm control --reload-rules && sudo udevadm trigger`, then replug), and add yourself to the serial group (`sudo usermod -aG dialout $USER`, re-login).
+
+**Edge device (recording only):** the firmware runs on the Teensy, so a field box that only records needs **no PlatformIO at all** — just the udev rules + `dialout` above, then `record_ctl.bash` (pure bash) or `session_client.cpp` (any g++). Install PlatformIO (`python3 -m pip install --user platformio`) only if the device must also flash firmware; the first build downloads the toolchain and needs internet once.
 
 ## Configuration
 
