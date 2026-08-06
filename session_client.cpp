@@ -135,6 +135,13 @@ public:
 		return !write_error_;  // false = log file write failed (e.g. disk full)
 	}
 
+	// errno of the last failed open() port setup (0 = no failure); lets the
+	// caller tell EACCES (no tty permission) from EBUSY (port held) from
+	// ENOENT (board gone) instead of guessing
+	int lastErrno() const {
+		return last_errno_;
+	}
+
 private:
 	using Clock = std::chrono::steady_clock;
 
@@ -149,10 +156,12 @@ private:
 	bool openPortLocked() {
 		fd_ = ::open(port_path_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
 		if (fd_ < 0) {
+			last_errno_ = errno;
 			return false;
 		}
 		termios tio{};
 		if (tcgetattr(fd_, &tio) != 0) {
+			last_errno_ = errno;  // capture before close() can clobber errno
 			closePortLocked();
 			return false;
 		}
@@ -164,9 +173,11 @@ private:
 		tio.c_cc[VTIME] = 1;	 // 0.1 s read timeout -> reader can poll running_
 		fcntl(fd_, F_SETFL, 0);	 // drop O_NONBLOCK; VMIN/VTIME govern reads now
 		if (tcsetattr(fd_, TCSANOW, &tio) != 0) {
+			last_errno_ = errno;
 			closePortLocked();
 			return false;
 		}
+		last_errno_ = 0;
 		return true;
 	}
 
@@ -262,6 +273,7 @@ private:
 	std::string session_path_;
 	std::string freq_spec_;	 // "0:25,1:2" - per-channel Hz for this run
 	int fd_ = -1;
+	int last_errno_ = 0;  // errno of the last failed port setup
 	std::ofstream out_;
 	std::thread reader_;
 	std::mutex io_mtx_;	 // guards fd_ open/close/write
@@ -290,7 +302,7 @@ int main(int argc, char **argv) {
 	}
 	SensorSyncSession s;
 	if (!s.open(argv[1])) {
-		fprintf(stderr, "open %s failed\n", argv[1]);
+		fprintf(stderr, "open %s failed: %s\n", argv[1], strerror(s.lastErrno()));
 		return 1;
 	}
 	if (!s.start(argv[2], freqs)) {
