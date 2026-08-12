@@ -5,7 +5,7 @@
    role="img"
    version="1.1"
    id="svg58"
-   sodipodi:docname="teensy_bob09118_fx10e_trigger_wiring.svg"
+   sodipodi:docname="teensy_fx10e_trigger_wiring.svg"
    height="800"
    inkscape:version="1.4.3 (0d15f75042, 2025-12-25)"
    xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
@@ -26,8 +26,8 @@
      inkscape:deskcolor="#d1d1d1"
      showguides="false"
      inkscape:zoom="1"
-     inkscape:cx="58.5"
-     inkscape:cy="350.5"
+     inkscape:cx="497.5"
+     inkscape:cy="387.5"
      inkscape:window-width="3373"
      inkscape:window-height="1371"
      inkscape:window-x="0"
@@ -799,7 +799,7 @@
        style="color:#0b0b0b;font-weight:400;font-size:12px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:central;text-anchor:end;opacity:1;fill:#0f6e56;stroke:none;stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter"
        id="text29">Trigger PIN</text>
     <text
-       x="248.9234"
+       x="248.06772"
        y="413.52518"
        text-anchor="end"
        dominant-baseline="central"
@@ -820,21 +820,21 @@
        style="color:#0b0b0b;font-weight:400;font-size:12px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:central;text-anchor:end;fill:#0f6e56;stroke:none;stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter"
        id="text29-7-2-3">ToD PIN</text>
     <text
-       x="249.34875"
+       x="248.06772"
        y="503.45499"
        text-anchor="end"
        dominant-baseline="central"
        style="color:#0b0b0b;font-weight:400;font-size:12px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:central;text-anchor:end;fill:#0f6e56;stroke:none;stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter"
        id="text29-7-7">5 V PIN</text>
     <text
-       x="248.06772"
+       x="247.63571"
        y="287.79092"
        text-anchor="end"
        dominant-baseline="central"
        style="color:#0b0b0b;font-weight:400;font-size:12px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:central;text-anchor:end;opacity:1;fill:#0f6e56;stroke:none;stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter"
        id="text30">GND</text>
     <text
-       x="248.04189"
+       x="247.63571"
        y="587.12817"
        text-anchor="end"
        dominant-baseline="central"
@@ -860,13 +860,13 @@
      id="g38"
      transform="translate(326.00524,32.831418)">
     <rect
-       x="260"
-       y="90"
-       width="170"
-       height="230"
-       rx="12"
+       x="260.03043"
+       y="90.030418"
+       width="169.93916"
+       height="258.93054"
+       rx="11.995706"
        stroke-width="0.5"
-       style="color:#0b0b0b;font-weight:400;font-size:16px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:auto;text-anchor:start;opacity:1;fill:#e0181c;fill-opacity:0.703252;stroke:#960000;stroke-width:1;stroke-linecap:butt;stroke-linejoin:miter;stroke-dasharray:none;stroke-opacity:1"
+       style="color:#0b0b0b;font-weight:400;font-size:16px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:auto;text-anchor:start;opacity:1;fill:#e0181c;fill-opacity:0.703252;stroke:#960000;stroke-width:1.06084;stroke-linecap:butt;stroke-linejoin:miter;stroke-dasharray:none;stroke-opacity:1"
        id="rect30" />
     <text
        x="345"
@@ -887,10 +887,10 @@
          style="fill:#ffffff;fill-opacity:1;stroke:none;stroke-width:1;stroke-dasharray:none;stroke-opacity:1"
          id="tspan59" /></text>
     <line
-       x1="345"
-       y1="148"
-       x2="345"
-       y2="288"
+       x1="344.29291"
+       y1="136.68629"
+       x2="344.29291"
+       y2="307.09186"
        stroke="#888780"
        stroke-width="0.75"
        stroke-dasharray="4 4"
@@ -898,13 +898,13 @@
        id="line32" />
     <text
        x="345"
-       y="303"
+       y="331.28427"
        text-anchor="middle"
        dominant-baseline="central"
        style="color:#0b0b0b;font-weight:400;font-size:12px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:central;text-anchor:middle;opacity:1;fill:#ffffff;fill-opacity:1;stroke:none;stroke-width:1;stroke-linecap:butt;stroke-linejoin:miter;stroke-dasharray:none;stroke-opacity:1"
        id="text33">Electrical Isolation</text>
     <text
-       x="269.51999"
+       x="269.51474"
        y="210.0435"
        text-anchor="start"
        dominant-baseline="central"
@@ -913,7 +913,7 @@
          style="fill:#ffffff;fill-opacity:1;stroke:none;stroke-width:1;stroke-dasharray:none;stroke-opacity:1"
          id="tspan62">IN1</tspan></text>
     <text
-       x="269.26801"
+       x="269.26276"
        y="256.37164"
        text-anchor="start"
        dominant-baseline="central"
@@ -922,29 +922,29 @@
          style="fill:#ffffe1;fill-opacity:1;stroke:none;stroke-width:1;stroke-dasharray:none;stroke-opacity:1"
          id="tspan63">GND</tspan></text>
     <text
-       x="420.99689"
-       y="256.15747"
+       x="421.52676"
+       y="302.82651"
        text-anchor="end"
        dominant-baseline="central"
-       style="color:#0b0b0b;font-weight:400;font-size:12px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:central;text-anchor:end;opacity:1;fill:#52514e;stroke:none;stroke-width:1;stroke-linecap:butt;stroke-linejoin:miter;stroke-dasharray:none;stroke-opacity:1"
+       style="color:#0b0b0b;font-weight:400;font-size:12px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;text-align:end;dominant-baseline:central;text-anchor:end;opacity:1;fill:#52514e;stroke:none;stroke-width:1;stroke-linecap:butt;stroke-linejoin:miter;stroke-dasharray:none;stroke-opacity:1"
        id="text36"><tspan
          style="fill:#ffffff;fill-opacity:1;stroke:none;stroke-width:1;stroke-dasharray:none;stroke-opacity:1"
          id="tspan60">OUT1</tspan></text>
     <text
-       x="418.39288"
+       x="418.92276"
        y="152.00957"
        text-anchor="end"
        dominant-baseline="central"
-       style="color:#0b0b0b;font-weight:400;font-size:12px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:central;text-anchor:end;opacity:1;fill:#52514e;stroke:none;stroke-width:1;stroke-linecap:butt;stroke-linejoin:miter;stroke-dasharray:none;stroke-opacity:1"
+       style="color:#0b0b0b;font-weight:400;font-size:12px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;text-align:end;dominant-baseline:central;text-anchor:end;opacity:1;fill:#52514e;stroke:none;stroke-width:1;stroke-linecap:butt;stroke-linejoin:miter;stroke-dasharray:none;stroke-opacity:1"
        id="text37"><tspan
          style="fill:#ffffff;fill-opacity:1;stroke:none;stroke-width:1;stroke-dasharray:none;stroke-opacity:1"
          id="tspan61">HV</tspan></text>
     <text
-       x="421.80411"
+       x="419.81079"
        y="204.01752"
        text-anchor="end"
        dominant-baseline="central"
-       style="color:#0b0b0b;font-weight:400;font-size:12px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:central;text-anchor:end;opacity:1;fill:#52514e;stroke:none;stroke-width:1;stroke-linecap:butt;stroke-linejoin:miter;stroke-dasharray:none;stroke-opacity:1"
+       style="color:#0b0b0b;font-weight:400;font-size:12px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;text-align:end;dominant-baseline:central;text-anchor:end;opacity:1;fill:#52514e;stroke:none;stroke-width:1;stroke-linecap:butt;stroke-linejoin:miter;stroke-dasharray:none;stroke-opacity:1"
        id="text38"><tspan
          style="fill:#ffffff;fill-opacity:1;stroke:none;stroke-width:1;stroke-dasharray:none;stroke-opacity:1"
          id="tspan64">HVG</tspan></text>
@@ -954,13 +954,13 @@
      id="g42"
      transform="matrix(0.87164183,0,0,1.0001458,392.13885,125.90596)">
     <rect
-       x="500.09656"
-       y="100.09653"
-       width="173.98186"
-       height="388.47427"
-       rx="20.946936"
+       x="500.00891"
+       y="100.01055"
+       width="174.15718"
+       height="226.03537"
+       rx="20.968044"
        stroke-width="0.5"
-       style="color:#0b0b0b;font-weight:400;font-size:16px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:auto;text-anchor:start;opacity:1;fill:#eeedfe;stroke:#534ab7;stroke-width:0.690905px;stroke-linecap:butt;stroke-linejoin:miter"
+       style="color:#0b0b0b;font-weight:400;font-size:16px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:auto;text-anchor:start;opacity:1;fill:#eeedfe;stroke:#534ab7;stroke-width:0.527283px;stroke-linecap:butt;stroke-linejoin:miter"
        id="rect38" />
     <text
        x="523.94122"
@@ -980,31 +980,31 @@
        style="color:#0b0b0b;font-weight:400;font-size:12px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:central;text-anchor:middle;opacity:1;fill:#534ab7;stroke:none;stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter"
        id="text40" />
     <text
-       x="504.01685"
-       y="163.83911"
+       x="506.43863"
+       y="210.19769"
        text-anchor="start"
        dominant-baseline="central"
        style="color:#0b0b0b;font-weight:400;font-size:12.8523px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:central;text-anchor:start;opacity:1;fill:#534ab7;stroke:none;stroke-width:1.04831px;stroke-linecap:butt;stroke-linejoin:miter"
        id="text41"
-       transform="scale(1.0087767,0.99129965)">8 · ISO_TRIGGER</text>
+       transform="scale(1.0087767,0.99129966)">8 · ISO_TRIGGER</text>
     <text
-       x="506.63538"
+       x="506.85367"
        y="291.03372"
        text-anchor="start"
        dominant-baseline="central"
        style="color:#0b0b0b;font-weight:400;font-size:12.8523px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:central;text-anchor:start;fill:#534ab7;stroke:none;stroke-width:1.04783;stroke-linecap:butt;stroke-linejoin:miter;stroke-dasharray:none"
        id="text42-8"
-       transform="scale(1.0079772,0.99208596)"><tspan
+       transform="scale(1.0079772,0.99208594)"><tspan
          style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;-inkscape-font-specification:'Anthropic Sans, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif'"
          id="tspan67">2 · ISO_STROBE</tspan></text>
     <text
-       x="493.30432"
-       y="480.15265"
+       x="491.8378"
+       y="169.5694"
        text-anchor="start"
        dominant-baseline="central"
        style="color:#0b0b0b;font-weight:400;font-size:12.8523px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:central;text-anchor:start;fill:#534ab7;stroke:none;stroke-width:1.11992px;stroke-linecap:butt;stroke-linejoin:miter"
        id="text42-2"
-       transform="scale(1.0385226,0.96290632)">6 · ISO_GND</text>
+       transform="scale(1.0385226,0.96290634)">6 · ISO_GND</text>
     <text
        xml:space="preserve"
        style="font-size:17.1364px;writing-mode:lr-tb;direction:ltr;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:1.00034;stroke-dasharray:none;stroke-dashoffset:0;stroke-opacity:1"
@@ -1047,14 +1047,14 @@
        style="color:#0b0b0b;font-weight:400;font-size:12px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:central;text-anchor:middle;opacity:1;fill:#854f0b;stroke:none;stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter"
        id="text44">12 V</text>
     <text
-       x="510"
+       x="511.04861"
        y="299"
        text-anchor="start"
        dominant-baseline="central"
        style="color:#0b0b0b;font-weight:400;font-size:14px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:central;text-anchor:start;opacity:1;fill:#000000;fill-opacity:1;stroke:none;stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter"
        id="text45">−</text>
     <text
-       x="510"
+       x="511.32864"
        y="324"
        text-anchor="start"
        dominant-baseline="central"
@@ -1272,7 +1272,7 @@
   <line
      x1="505.03412"
      y1="588.75665"
-     x2="828.32178"
+     x2="741.34766"
      y2="588.75665"
      stroke="#888780"
      stroke-width="1.5"
@@ -1280,10 +1280,10 @@
      style="color:#0b0b0b;font-weight:400;font-size:16px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:auto;text-anchor:start;fill:none;stroke:#000000;stroke-width:1.5;stroke-linecap:butt;stroke-linejoin:miter;stroke-dasharray:none;stroke-opacity:1"
      id="line48-4" />
   <line
-     x1="755.5152"
-     y1="287.79315"
-     x2="827.12317"
-     y2="287.79315"
+     x1="755.46503"
+     y1="334.29315"
+     x2="827.63025"
+     y2="334.29315"
      stroke="#D85A30"
      stroke-width="1.5"
      fill="none"
@@ -1309,9 +1309,9 @@
      stroke-width="1.5"
      fill="none"
      mask="url(#imagine-text-gaps-ay2j6c)"
-     style="color:#0b0b0b;font-weight:400;font-size:16px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:auto;text-anchor:start;opacity:1;fill:none;stroke:#000000;stroke-width:1.71838;stroke-linecap:butt;stroke-linejoin:miter;stroke-dasharray:none;stroke-opacity:1"
+     style="color:#0b0b0b;font-weight:400;font-size:16px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:auto;text-anchor:start;opacity:1;fill:none;stroke:#000000;stroke-width:1.3275676;stroke-linecap:butt;stroke-linejoin:miter;stroke-dasharray:none;stroke-opacity:1"
      id="line53"
-     transform="matrix(1,0,0,0.76198114,325.81669,11.203426)" />
+     transform="matrix(1,0,0,1.2766423,325.81669,-87.212981)" />
   <line
      x1="478"
      y1="185"
@@ -1321,9 +1321,9 @@
      stroke-width="1.5"
      fill="none"
      mask="url(#imagine-text-gaps-ay2j6c-7)"
-     style="color:#0b0b0b;font-weight:400;font-size:16px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:auto;text-anchor:start;fill:none;stroke:#ff0000;stroke-width:1.7943;stroke-linecap:butt;stroke-linejoin:miter;stroke-dasharray:none;stroke-opacity:1"
+     style="color:#0b0b0b;font-weight:400;font-size:16px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:auto;text-anchor:start;fill:none;stroke:#ff0000;stroke-width:1.78704881;stroke-linecap:butt;stroke-linejoin:miter;stroke-dasharray:none;stroke-opacity:1"
      id="line53-0"
-     transform="matrix(0,1,-0.69886472,0,961.69621,-294.84551)" />
+     transform="matrix(0,1,-0.70454654,0,963.37235,-294.84551)" />
   <line
      x1="478"
      y1="185"
@@ -1339,13 +1339,23 @@
   <line
      x1="802.95697"
      y1="157.38336"
-     x2="828.23541"
+     x2="828.79791"
      y2="157.38336"
      stroke="#888780"
      stroke-width="1.5"
      fill="none"
      style="color:#0b0b0b;font-weight:400;font-size:16px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:auto;text-anchor:start;opacity:1;fill:none;stroke:#000000;stroke-width:1.5;stroke-linecap:butt;stroke-linejoin:miter;stroke-dasharray:none;stroke-opacity:1"
      id="line55" />
+  <line
+     x1="803.15485"
+     y1="288.6423"
+     x2="828.34393"
+     y2="288.6423"
+     stroke="#888780"
+     stroke-width="1.5"
+     fill="none"
+     style="color:#0b0b0b;font-weight:400;font-size:16px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:auto;text-anchor:start;fill:none;stroke:#000000;stroke-width:1.5;stroke-linecap:butt;stroke-linejoin:miter;stroke-dasharray:none;stroke-opacity:1"
+     id="line55-6" />
   <metadata
      id="metadata64">
     <rdf:RDF>
