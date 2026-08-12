@@ -66,9 +66,9 @@ struct TriggerCfg {
 
 static const TriggerCfg TRIG_CFG[TRIG_MAX] = {
 	// name  pin  freq_hz  phase_s  pulse_us  active_high
-	{ "FX10E", 24, 50.0, 0.0, 50, true },
-	{ "JAI", 25, 1.0, 0.0, 50, true },
-	{ "SPARE", 26, 1.0, 0.0, 1000, true },
+	{ "FX10E", 22, 50.0, 0.0, 50, true },
+	{ "JAI", 21, 1.0, 0.0, 50, true },
+	{ "SPARE", 20, 1.0, 0.0, 1000, true },
 };
 
 
@@ -86,9 +86,9 @@ struct StrobeCfg {
 
 static const StrobeCfg STROBE_CFG[STROBE_MAX] = {
 	// name  pin  active_high
-	{ "FX10E_EXP", 39, true },
-	{ "JAI_EXP", 40, true },
-	{ "AUX_EXP", 41, true },
+	{ "FX10E_EXP", 19, true },
+	{ "JAI_EXP", 18, true },
+	{ "AUX_EXP", 17, true },
 };
 
 
