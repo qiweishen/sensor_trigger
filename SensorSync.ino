@@ -96,20 +96,31 @@ static bool waitTx(int bytes, uint32_t timeout_ms) {
 
 
 // ---------------------------------------------------------------------------
-static void printHealth() {
-	// whole block < 512 B; skip rather than block
+static void printHealth(bool final) {
+	// The aggregate line fits in 512 B. Optional channel lines reserve their own space.
 	if (Serial.availableForWrite() < 512) {
 		return;
 	}
-	Serial.printf("#H up=%lu en=%d pps=%lu ppsdt=%.6f ppsdrops=%lu tod=%lu todb=%lu todtrunc=%lu tdrops=%lu sdrops=%lu host=%lu\n",
+	unsigned long long skipped = 0, stalled = 0;
+	for (uint8_t i = 0; i < TRIG_MAX; ++i) {
+		skipped += channels::skippedCount(i);
+		stalled += channels::stalledCount(i);
+	}
+	Serial.printf(final
+		? "#HFINAL up=%lu en=%d pps=%lu ppsdt=%.6f ppsdrops=%lu tod=%lu todb=%lu todtrunc=%lu tdrops=%lu sdrops=%lu host=%lu skip=%llu stall=%llu\n"
+		: "#H up=%lu en=%d pps=%lu ppsdt=%.6f ppsdrops=%lu tod=%lu todb=%lu todtrunc=%lu tdrops=%lu sdrops=%lu host=%lu skip=%llu stall=%llu\n",
 				  millis(), channels::enabled() ? 1 : 0, timesync::ppsRawCount(), timesync::lastPpsIntervalSec(),
 				  timesync::ppsDrops(), timesync::todCount(), timesync::todBytes(), timesync::todTruncated(),
-				  channels::trigDrops(), channels::strobeDrops(), static_cast<unsigned long>(g_host_drops));
+					  channels::trigDrops(), channels::strobeDrops(), static_cast<unsigned long>(g_host_drops), skipped, stalled);
+	// The final aggregate carries every loss counter, without competing with the STOP marker.
+	if (final) return;
 	for (uint8_t i = 0; i < TRIG_MAX; i++) {
+		if (Serial.availableForWrite() < 128) return;
 		Serial.printf("#Ht %u %-8s n=%lu skip=%lu stall=%lu\n", i, TRIG_CFG[i].name, channels::trigCount(i),
 					  channels::skippedCount(i), channels::stalledCount(i));
 	}
 	for (uint8_t i = 0; i < STROBE_MAX; i++) {
+		if (Serial.availableForWrite() < 128) return;
 		Serial.printf("#Hs %u %-10s n=%lu\n", i, STROBE_CFG[i].name, channels::strobeCount(i));
 	}
 }
@@ -134,6 +145,9 @@ static void printHeader() {
 	}
 	for (uint8_t i = 0; i < STROBE_MAX; i++) {
 		Serial.printf("#STROBE,%u,%s,%u,ah=%u\n", i, STROBE_CFG[i].name, STROBE_CFG[i].pin, STROBE_CFG[i].active_high ? 1 : 0);
+	}
+	if (waitTx(160, 250)) {
+		Serial.println("#TIME,T=scheduled_compare_or_late_fallback,S=GPIO_ISR_sample,Z=sentence_read,P=capture_or_ISR_per_build");
 	}
 }
 
@@ -191,6 +205,7 @@ static void drainAll(uint32_t deadline_ms) {
 			}
 		}
 	}
+	if (more) ++g_host_drops; // deadline prevented confirmation that the tail was drained
 }
 
 
@@ -206,7 +221,11 @@ static void closeRunningSession() {
 	g_running = false;
 	channels::setEnabled(false);
 	drainAll(500);	// flush the session tail before the marker
-	if (waitTx(512, 250)) {	 // marker line can exceed kLineMax (long path)
+	// Preserve final loss counters BEFORE resetStats/resetCounts. A normal STOP
+	// marker is emitted only after the final health block could be sent.
+	const bool final_stats_sent = waitTx(512, 250);
+	if (final_stats_sent) printHealth(true);
+	if (final_stats_sent && waitTx(512, 250)) {	 // marker line can exceed kLineMax (long path)
 		Serial.printf("#SESSION,STOP,%s\n", g_session_path);
 	}
 	// all-zero while idle; next START counts from 0
@@ -311,7 +330,7 @@ static void handleCommand(char *s) {
 	} else if (strncmp(s, "STOP", 4) == 0 && boundary(s[4])) {
 		stopSession();
 	} else if (strcmp(s, "s") == 0 || strcmp(s, "STATUS") == 0) {
-		g_running ? printHealth() : printIdle();
+		g_running ? printHealth(false) : printIdle();
 	} else if (strcmp(s, "h") == 0 || strcmp(s, "HEADER") == 0) {
 		printHeader();
 	} else if (Serial.availableForWrite() >= kLineMax) {  // aid driver debugging; drop if no room
@@ -406,16 +425,23 @@ void loop() {
 	// (256: "START freq=... " + a long absolute log path must fit untruncated)
 	static char cmd[256];
 	static uint16_t cmdlen = 0;
+	static bool cmd_overflow = false;
 	while (Serial.available()) {
 		const char c = static_cast<char>(Serial.read());
 		if (c == '\n' || c == '\r') {
-			if (cmdlen > 0) {
+			if (cmd_overflow) {
+				if (waitTx(64, 50)) Serial.println("#ERR,command_too_long");
+				cmdlen = 0;
+				cmd_overflow = false;
+			} else if (cmdlen > 0) {
 				cmd[cmdlen] = 0;
 				handleCommand(cmd);
 				cmdlen = 0;
 			}
 		} else if (cmdlen < sizeof(cmd) - 1) {
 			cmd[cmdlen++] = c;
+		} else {
+			cmd_overflow = true;
 		}
 	}
 
@@ -423,6 +449,6 @@ void loop() {
 	static uint32_t last = 0;
 	if (millis() - last > 5000) {
 		last = millis();
-		g_running ? printHealth() : printIdle();
+		g_running ? printHealth(false) : printIdle();
 	}
 }

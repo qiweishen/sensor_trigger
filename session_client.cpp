@@ -10,8 +10,8 @@
 //
 // The freq list is optional; {ch, 0} switches a channel off, omitted channels keep
 // their config.h rate. It rides inside the START command ("START freq=0:25,1:2 <path>"),
-// so a watchdog re-START after a board reboot restores the same rates. The board
-// echoes the EFFECTIVE rates in the "#TRIG" header - verify there, and invalid
+// so the board receives the rate request and session identity together. The board
+// echoes the EFFECTIVE rates in the "#TRIG" header; invalid
 // entries answer "#ERR,bad_freq,..." while keeping the old rate.
 //
 // start() flushes stale input, sends "START <path>", opens <path>, and spawns a
@@ -19,19 +19,16 @@
 // The board cannot write the host filesystem: <path> is echoed into the log's
 // "#SESSION,START,<path>" line; this client does the file I/O.
 //
-// Recovery while a run is active:
-//   - port drops (USB glitch / board reboot): reader re-opens the same path until
-//     it returns, appending to the SAME file - prefer a /dev/serial/by-id/ path
-//   - "#IDLE" seen in the stream (board rebooted to idle, or a lost START): the
-//     watchdog re-sends START; the new "#SESSION,START" marker lands in the same
-//     file and postprocess.py splits the sessions
+// A port drop, unexpected #IDLE, repeated START, #ERR or reported event loss
+// latches an integrity failure. The caller must end this camera/time epoch;
+// an automatic board restart would destroy the original frame association.
 //
 // Protocol (newline-terminated, 115200 8N1 - do not change the baud):
 //   host -> board:  "START [freq=<ch>:<hz>,...] [path]" | "STOP" | "s" (status) | "h" (header)
 //   board -> host:  "#SESSION,START,<path>", header, P/T/S/Z data + "#H" health,
-//                   "#SESSION,STOP,<path>"; "#IDLE,up=<ms>" while idle
+//                   "#HFINAL ...", "#SESSION,STOP,<path>"; "#IDLE,up=<ms>" while idle
 //
-// Build demo:  g++ -std=c++17 -O2 -pthread -DSESSION_CLIENT_DEMO session_client.cpp -o session_client
+// Build demo:  g++ -std=c++20 -O2 -pthread -DSESSION_CLIENT_DEMO session_client.cpp -o session_client
 // Run demo:    ./session_client /dev/ttyACM0 /tmp/run.log 5 25    (trig[0] at 25 Hz)
 
 #include <atomic>
@@ -40,7 +37,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -51,11 +47,13 @@
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
+#include "session_protocol.h"
 
 class SensorSyncSession {
 public:
 	~SensorSyncSession() {
 		stop();
+		if (out_) ::fclose(out_); // also covers an allocation exception during start()
 		std::lock_guard<std::mutex> lk(io_mtx_);
 		closePortLocked();
 	}
@@ -76,8 +74,12 @@ public:
 		if (running_) {
 			return false;
 		}
-		out_.open(path, std::ios::binary | std::ios::trunc);
+		if (path.find_first_of("\r\n") != std::string::npos || path.find('\0') != std::string::npos) return false;
+		const int log_fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+		if (log_fd < 0) return false;
+		out_ = ::fdopen(log_fd, "wb");
 		if (!out_) {
+			::close(log_fd);
 			return false;
 		}
 		session_path_ = path;
@@ -90,21 +92,46 @@ public:
 		{
 			std::lock_guard<std::mutex> lk(io_mtx_);
 			if (fd_ < 0) {
-				out_.close();
+				::fclose(out_);
+				out_ = nullptr;
 				return false;
 			}
 			// stale #IDLE lines buffered since open() must not precede #SESSION,START
-			tcflush(fd_, TCIFLUSH);
+			if (tcflush(fd_, TCIFLUSH) != 0) {
+				::fclose(out_);
+				out_ = nullptr;
+				return false;
+			}
 			if (!sendStartLocked()) {
-				out_.close();
+				writeCommandLocked("STOP\n"); // best effort after an ambiguous/partial START write
+				::fclose(out_);
+				out_ = nullptr;
 				return false;
 			}
 		}
 		write_error_ = false;
+		protocol_error_ = false;
+		start_ack_ = false;
+		stop_ack_ = false;
+		protocol_ = {};
 		line_len_ = 0;
 		stopping_ = false;
 		running_ = true;
-		reader_ = std::thread(&SensorSyncSession::readerLoop, this);
+		try {
+			reader_ = std::thread(&SensorSyncSession::readerLoop, this);
+		} catch (...) {
+			stop(); // even a thread-creation failure must stop pulses already requested
+			return false;
+		}
+		const auto deadline = Clock::now() + std::chrono::seconds(3);
+		while (!start_ack_ && ok() && Clock::now() < deadline) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+		if (!start_ack_ || !ok()) {
+			protocol_error_ = true;
+			stop();
+			return false;
+		}
 		return true;
 	}
 
@@ -113,26 +140,35 @@ public:
 		if (!running_) {
 			return;
 		}
-		stopping_ = true;  // mute the watchdog: post-STOP "#IDLE" is expected, not a reboot
+		stopping_ = true;  // post-STOP "#IDLE" is expected
 		{
 			std::lock_guard<std::mutex> lk(io_mtx_);
 			if (fd_ >= 0) {
 				const char *cmd = "STOP\n";
-				const ssize_t wr = ::write(fd_, cmd, std::strlen(cmd));
-				(void) wr;
+				if (!writeCommandLocked(cmd)) protocol_error_ = true;
+			} else {
+				protocol_error_ = true;
 			}
 		}
 		// let "#SESSION,STOP" land in the file before tearing the reader down
-		std::this_thread::sleep_for(std::chrono::milliseconds(300));
+		const auto deadline = Clock::now() + std::chrono::seconds(3); // firmware drains + emits final health before STOP
+		while (!stop_ack_ && !write_error_ && Clock::now() < deadline) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+		if (!stop_ack_) protocol_error_ = true;
 		running_ = false;
 		if (reader_.joinable()) {
 			reader_.join();
 		}
-		out_.close();
+		if (out_) {
+			if (::fflush(out_) != 0 || ::fdatasync(::fileno(out_)) != 0) write_error_ = true;
+			if (::fclose(out_) != 0) write_error_ = true;
+			out_ = nullptr;
+		}
 	}
 
 	bool ok() const {
-		return !write_error_;  // false = log file write failed (e.g. disk full)
+		return !write_error_ && !protocol_error_;
 	}
 
 	// errno of the last failed open() port setup (0 = no failure); lets the
@@ -154,7 +190,7 @@ private:
 	}
 
 	bool openPortLocked() {
-		fd_ = ::open(port_path_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+		fd_ = ::open(port_path_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
 		if (fd_ < 0) {
 			last_errno_ = errno;
 			return false;
@@ -166,13 +202,17 @@ private:
 			return false;
 		}
 		cfmakeraw(&tio);
+		tio.c_cflag &= ~CSTOPB;
+#ifdef CRTSCTS
+		tio.c_cflag &= ~CRTSCTS;
+#endif
 		cfsetispeed(&tio, B115200);
 		cfsetospeed(&tio, B115200);
 		tio.c_cflag |= (CLOCAL | CREAD);
 		tio.c_cc[VMIN] = 0;
 		tio.c_cc[VTIME] = 1;	 // 0.1 s read timeout -> reader can poll running_
-		fcntl(fd_, F_SETFL, 0);	 // drop O_NONBLOCK; VMIN/VTIME govern reads now
-		if (tcsetattr(fd_, TCSANOW, &tio) != 0) {
+		// Drop O_NONBLOCK so VMIN/VTIME govern reads; failure would break EOF detection.
+		if (fcntl(fd_, F_SETFL, 0) != 0 || tcsetattr(fd_, TCSANOW, &tio) != 0) {
 			last_errno_ = errno;
 			closePortLocked();
 			return false;
@@ -182,14 +222,26 @@ private:
 	}
 
 	bool sendStartLocked() {
-		// freq rides in START so a watchdog re-START restores the same rates
+		// Board command storage is bounded; never allow silent truncation of its identity.
 		std::string cmd = "START ";
 		if (!freq_spec_.empty()) {
 			cmd += "freq=" + freq_spec_ + " ";
 		}
 		cmd += session_path_ + "\n";
-		last_start_ = Clock::now();
-		return fd_ >= 0 && ::write(fd_, cmd.data(), cmd.size()) == static_cast<ssize_t>(cmd.size());
+		if (cmd.size() > 255) return false;
+		return writeCommandLocked(cmd);
+	}
+
+	bool writeCommandLocked(const std::string &cmd) {
+		if (fd_ < 0) return false;
+		std::size_t sent = 0;
+		while (sent < cmd.size()) {
+			const ssize_t n = ::write(fd_, cmd.data() + sent, cmd.size() - sent);
+			if (n < 0 && errno == EINTR) continue;
+			if (n <= 0) return false;
+			sent += static_cast<std::size_t>(n);
+		}
+		return true;
 	}
 
 	// --- reader thread -------------------------------------------------------
@@ -202,22 +254,16 @@ private:
 				std::lock_guard<std::mutex> lk(io_mtx_);
 				fd = fd_;
 			}
-			if (fd < 0) {  // port lost: retry the same path until it re-enumerates
-				std::this_thread::sleep_for(std::chrono::milliseconds(500));
-				std::lock_guard<std::mutex> lk(io_mtx_);
-				if (running_ && openPortLocked()) {
-					fast_zero = 0;
-					// no tcflush here: a still-running session may already be streaming
-				}
-				continue;
+			if (fd < 0) {
+				protocol_error_ = true;
+				break; // a new clock epoch must not be silently joined to this recording
 			}
 			const auto t0 = Clock::now();
 			const ssize_t n = ::read(fd, buf, sizeof(buf));
 			if (n > 0) {
 				fast_zero = 0;
-				out_.write(buf, n);
-				out_.flush();
-				if (!out_) {  // disk full / I/O error: surface, stop consuming
+				if (::fwrite(buf, 1, static_cast<std::size_t>(n), out_) != static_cast<std::size_t>(n) ||
+				    ::fflush(out_) != 0) {
 					write_error_ = true;
 					break;
 				}
@@ -226,15 +272,17 @@ private:
 				if (errno == EINTR) {
 					continue;
 				}
-				// unplug / reboot: EIO or ENXIO -> drop the fd, reconnect above
+				// Unplug/reboot ends this epoch; never reopen into the same timing log.
 				std::lock_guard<std::mutex> lk(io_mtx_);
 				closePortLocked();
+				protocol_error_ = true;
 			} else {  // n == 0: VTIME timeout - or EOF, which returns instantly
 				if (Clock::now() - t0 < std::chrono::milliseconds(20)) {
 					if (++fast_zero >= 20) {  // sustained instant EOF = dead port
 						fast_zero = 0;
 						std::lock_guard<std::mutex> lk(io_mtx_);
 						closePortLocked();
+						protocol_error_ = true;
 					}
 				} else {
 					fast_zero = 0;
@@ -243,29 +291,25 @@ private:
 		}
 	}
 
-	// watch the stream for "#IDLE": board is not in a session (reboot, or a lost
-	// START) -> re-send START, rate-limited. Data lines never start with #IDLE.
+	// Check acknowledgements, final counters and epoch continuity in complete lines.
 	void scanStream(const char *buf, size_t n) {
 		for (size_t i = 0; i < n; i++) {
 			const char c = buf[i];
 			if (c == '\n' || c == '\r') {
-				if (line_len_ >= 5 && memcmp(line_, "#IDLE", 5) == 0) {
-					maybeResendStart();
+				const std::string_view line(line_, line_len_);
+				for (const std::string_view prefix : {"#SESSION,START,", "#SESSION,STOP,"}) {
+					if (line.starts_with(prefix) && line.substr(prefix.size()) != session_path_) protocol_error_ = true;
 				}
+				protocol_.observe(line, stopping_.load());
+				if (protocol_.failed) protocol_error_ = true;
+				if (protocol_.starts > 0) start_ack_ = true;
+				if (protocol_.stop_received) stop_ack_ = true;
 				line_len_ = 0;
 			} else if (line_len_ < sizeof(line_)) {
-				line_[line_len_++] = c;	 // overlong lines just stop matching #IDLE
+				line_[line_len_++] = c;
+			} else {
+				protocol_error_ = true; // preserve bytes in the log, but never accept a truncated control record
 			}
-		}
-	}
-
-	void maybeResendStart() {
-		if (stopping_) {
-			return;
-		}
-		std::lock_guard<std::mutex> lk(io_mtx_);
-		if (Clock::now() - last_start_ > std::chrono::seconds(2)) {
-			sendStartLocked();
 		}
 	}
 
@@ -274,15 +318,18 @@ private:
 	std::string freq_spec_;	 // "0:25,1:2" - per-channel Hz for this run
 	int fd_ = -1;
 	int last_errno_ = 0;  // errno of the last failed port setup
-	std::ofstream out_;
+	std::FILE *out_ = nullptr;
 	std::thread reader_;
 	std::mutex io_mtx_;	 // guards fd_ open/close/write
 	std::atomic<bool> running_{ false };
 	std::atomic<bool> stopping_{ false };
 	std::atomic<bool> write_error_{ false };
-	char line_[16];
+	std::atomic<bool> protocol_error_{ false };
+	std::atomic<bool> start_ack_{ false };
+	std::atomic<bool> stop_ack_{ false };
+	SensorSyncProtocol protocol_; // reader-thread-only; state mirrored through atomics above
+	char line_[2048];
 	size_t line_len_ = 0;
-	Clock::time_point last_start_{};
 };
 
 
