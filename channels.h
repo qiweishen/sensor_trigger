@@ -6,8 +6,8 @@
 // =============================================================================
 //  channels - trigger generation + strobe read-back, raw.
 //
-//  Triggers: plain periodic GPT1 output-compare per channel, free-running (NOT
-//            GNSS-aligned); each edge's compare tick is queued for the host.
+//  Triggers: one GPT1 compare schedules all channels, free-running (NOT
+//            GNSS-aligned); ticks are sampled immediately after GPIO writes.
 //  Strobes:  both edges queued raw (tick + level); host reconstructs exposures.
 //  Per-channel seq numbers advance even on drop -> gaps visible in the log.
 // =============================================================================
@@ -26,7 +26,7 @@ namespace channels {
 	void setEnabled(bool on);
 	bool enabled();
 
-	// runtime frequency override (only while disabled). hz <= 0 disables the
+	// runtime frequency override (only while disabled). hz == 0 disables the
 	// channel deliberately; invalid hz is rejected (false) and the old rate kept
 	bool setFreqHz(uint8_t ch, double hz);
 	double freqHz(uint8_t ch);	// effective rate for the header (0 = disabled)
@@ -38,7 +38,7 @@ namespace channels {
 	uint32_t trigCount(uint8_t ch);		// trigger edges emitted (incl. dropped seq)
 	uint32_t strobeCount(uint8_t ch);	// strobe edges seen
 	uint32_t skippedCount(uint8_t ch);	// trigger periods skipped (ISR fell behind)
-	uint32_t stalledCount(uint8_t ch);	// armRise gave up; channel dead until next START
+	uint32_t stalledCount(uint8_t ch);	// scheduler overload; restart required
 	uint32_t trigDrops();				// trigger ring overflow drops
 	uint32_t strobeDrops();				// strobe ring overflow drops
 

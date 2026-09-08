@@ -33,6 +33,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <climits>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -74,7 +76,10 @@ public:
 		if (running_) {
 			return false;
 		}
-		if (path.find_first_of("\r\n") != std::string::npos || path.find('\0') != std::string::npos) return false;
+		if (path.size() > 223 || path.find_first_of("\r\n") != std::string::npos || path.find('\0') != std::string::npos) return false;
+		for (const auto &f : freqs) {
+			if (f.first < 0 || f.first >= 4 || !std::isfinite(f.second) || f.second < 0.0) return false;
+		}
 		const int log_fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
 		if (log_fd < 0) return false;
 		out_ = ::fdopen(log_fd, "wb");
@@ -334,38 +339,77 @@ private:
 
 
 #ifdef SESSION_CLIENT_DEMO
-// demo: ./session_client <port> <logfile> [seconds] [trig0_hz]
-static std::atomic<bool> g_interrupted{ false };
+// seconds=0 records until SIGINT/SIGTERM. Optional status file is for record_ctl.bash.
+static volatile std::sig_atomic_t g_interrupted = 0;
+
+static bool writeStatus(const char *path, const char *value) {
+	if (!path) return true;
+	const std::string tmp = std::string(path) + ".tmp";
+	FILE *f = ::fopen(tmp.c_str(), "w");
+	if (!f) return false;
+	const bool written = ::fprintf(f, "%s\n", value) > 0;
+	const bool closed = ::fclose(f) == 0;
+	return written && closed && ::rename(tmp.c_str(), path) == 0;
+}
+
+static bool parseFreqs(const char *arg, std::vector<std::pair<int, double>> &freqs) {
+	std::string spec = arg;
+	if (!spec.starts_with("freq=")) spec = "0:" + spec; // retain the original trig0_hz argument
+	else spec.erase(0, 5);
+	if (spec.empty()) return true;
+	std::size_t pos = 0;
+	while (pos < spec.size()) {
+		const auto end = spec.find(',', pos);
+		const std::string item = spec.substr(pos, end == std::string::npos ? end : end - pos);
+		char *colon = nullptr, *last = nullptr;
+		const long ch = strtol(item.c_str(), &colon, 10);
+		if (colon == item.c_str() || *colon != ':' || ch < 0 || ch >= 4) return false;
+		const double hz = strtod(colon + 1, &last);
+		if (last == colon + 1 || *last || !std::isfinite(hz) || hz < 0) return false;
+		freqs.emplace_back(static_cast<int>(ch), hz);
+		if (end == std::string::npos) return true;
+		pos = end + 1;
+		if (pos == spec.size()) return false;
+	}
+	return true;
+}
 
 int main(int argc, char **argv) {
-	if (argc < 3) {
-		fprintf(stderr, "usage: %s <port> <logfile> [seconds] [trig0_hz]\n", argv[0]);
+	if (argc < 3 || argc > 6) {
+		fprintf(stderr, "usage: %s <port> <logfile> [seconds; 0=until signal] [trig0_hz|freq=ch:hz,...] [status_file]\n", argv[0]);
 		return 2;
 	}
-	const int secs = (argc > 3) ? atoi(argv[3]) : 5;
+	const char *status_path = argc > 5 ? argv[5] : nullptr;
+	const auto fail = [&](const char *reason) {
+		fprintf(stderr, "%s\n", reason);
+		writeStatus(status_path, "FAILED");
+		return 1;
+	};
+	char *end = nullptr;
+	const long secs = argc > 3 ? strtol(argv[3], &end, 10) : 5;
+	if (secs < 0 || secs > INT_MAX || (argc > 3 && (end == argv[3] || *end))) return fail("invalid duration");
 	std::vector<std::pair<int, double>> freqs;
-	if (argc > 4) {
-		freqs.emplace_back(0, atof(argv[4]));  // field-decided camera rate
-	}
+	if (argc > 4 && !parseFreqs(argv[4], freqs)) return fail("invalid frequency specification");
+	signal(SIGINT, [](int) { g_interrupted = 1; });
+	signal(SIGTERM, [](int) { g_interrupted = 1; });
 	SensorSyncSession s;
 	if (!s.open(argv[1])) {
 		fprintf(stderr, "open %s failed: %s\n", argv[1], strerror(s.lastErrno()));
-		return 1;
+		return fail("cannot open recording port");
 	}
-	if (!s.start(argv[2], freqs)) {
-		fprintf(stderr, "start failed\n");
-		return 1;
+	if (!s.start(argv[2], freqs)) return fail("START failed (see timing log for protocol errors)");
+	if (!writeStatus(status_path, "RUNNING")) {
+		s.stop();
+		return fail("cannot publish recorder status");
 	}
-	signal(SIGINT, [](int) { g_interrupted = true; });	// Ctrl-C still sends STOP
-	fprintf(stderr, "logging to %s for %d s (Ctrl-C to stop early) ...\n", argv[2], secs);
-	for (int i = 0; i < secs * 10 && !g_interrupted; i++) {
-		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	const auto start = std::chrono::steady_clock::now();
+	while (!g_interrupted && s.ok() &&
+	       (secs == 0 || std::chrono::steady_clock::now() - start < std::chrono::seconds(secs))) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
 	}
 	s.stop();
-	if (!s.ok()) {
-		fprintf(stderr, "warning: log file write error (disk full?)\n");
-		return 1;
-	}
+	if (!s.ok()) return fail("recording failed: port, protocol, reported event loss, or log write error");
+	if (!writeStatus(status_path, "DONE")) return fail("cannot publish final recorder status");
 	fprintf(stderr, "done.\n");
 	return 0;
 }

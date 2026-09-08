@@ -1,222 +1,286 @@
 # SensorSync-Logger
 
-**Raw event logger for post-processed GNSS timing — Teensy 4.1.**
+Raw event logger for post-processed GNSS timing, based on Teensy 4.1.
 
-![platform](https://img.shields.io/badge/platform-Teensy%204.1-blue)
-![framework](https://img.shields.io/badge/framework-Arduino%20%7C%20PlatformIO-00979D)
-![post](https://img.shields.io/badge/post--processing-Python%20%2B%20NumPy-informational)
-![license](https://img.shields.io/badge/license-MIT-green)
-
-SensorSync-Logger takes an INS's **PPS** and **NMEA time-of-day**, fires camera **trigger pulses**, reads back each camera's **exposure-active / strobe** signal, and **logs raw ticks + raw NMEA** to the host. It computes **no GNSS time on the board**. A host script pairs ToD↔PPS and runs a **centered** sliding-window least-squares fit to convert every logged tick to GNSS time offline.
+The board timestamps INS PPS, forwards raw NMEA, generates camera triggers, and
+records exposure-active feedback. The host pairs PPS with verified NMEA time labels
+and fits ticks to UTC or GPS time offline. Triggers free-run; they are not GNSS-aligned.
 
 ```text
-INS ──PPS───────────► Teensy 4.1  (GPIO IRQ, or GPT1 hardware capture)
-    └─NMEA (ZDA/RMC)─► Serial2                 [logged raw, parsed offline]
-                          │
-      Teensy 4.1 ─────────┤
-                          ├─ trig[0..2]   ──► level shift ──► camera Trigger In   (free-running timer)
-                          ├─ strobe[0..2] ◄── level shift ◄── camera Exposure Active
-                          └─ USB          ──► raw event log ──► host ──► postprocess.py ──► frames.csv
+INS PPS -> input buffer -> GPIO 19       Teensy 4.1
+INS NMEA -> MAX3232 -> Serial1 RX0       GPT1 counter / trigger scheduler
+Camera Trigger In <- 9 V driver <- GPIO outputs
+Camera Exposure Active -> input buffers -> GPIO inputs
+Teensy USB -> session_client -> raw log -> postprocess.py -> frames.csv
 ```
 
-## Why log raw and post-process?
+## Hardware and defaults
 
-The board only needs to **know** when each frame was triggered and exposed — it does **not** need to fire triggers at exact GPS instants. Moving the timestamping offline is simpler and more accurate:
+Refer to [the schematic](resource/SCH_Schematic1_2026-08-26.pdf). Use the Arduino
+GPIO numbers below, not the schematic symbol's physical terminal numbers.
 
-- **No causal extrapolation bias.** A real-time fit only sees *past* PPS; its "now" estimate trails oscillator drift. Offline, each event sits at the **center** of its fit window — the bias cancels to first order.
-- **Re-runnable.** Window length, estimator, PPS↔ToD convention, outlier rejection: all chosen offline with hindsight, re-run at will.
-- **Same measurements.** Both approaches use identical raw ticks; only the fit differs.
+| Channel / signal | Trigger GPIO | Exposure GPIO | Default trigger rate |
+|---|---:|---:|---:|
+| 0: FX10E-1 | 33 | 18 | 50 Hz |
+| 1: FX10E-2 | 4 | 10 | off |
+| 2: JAI-1 | 37 | 14 | off |
+| 3: JAI-2 | 36 | 15 | off |
+| PPS | input 19 | — | rising edge |
+| NMEA | Serial1 RX: 0; TX: 1 | — | 115200, 8N1 |
 
-What post-processing can't recover is a **dropped sample** — so every stream carries a sequence number (gaps are detectable), the board **never blocks `loop()`** (drops are counted, never spun on), and health lines let you catch a dead PPS/ToD during acquisition, not at post-time.
+Only the first trigger is enabled by default, preserving the single-camera bring-up
+configuration. All four wired trigger pins are explicitly configured and parked
+low when disabled. Enable others with `START freq=...`. Channel counts are derived
+from the configuration arrays; do not add empty entries. GPIO conflicts involving
+trigger outputs, Serial1, PPS and exposure inputs are rejected at compile time.
 
-## Log format
+Exposure polarity currently remains `active_high=true` on all channels. **Verify
+this against each camera's model and output configuration before using exposure
+times.** The schematic has camera-side 1 kΩ pull-ups and non-inverting buffers:
+a disconnected camera reads HIGH, regardless of the Teensy's internal pull-down.
+A camera that sinks the line during exposure needs `active_high=false` in
+`STROBE_CFG`. Channel 2 belongs to JAI1 on GPIO 14; channel 3 belongs to JAI2 on GPIO 15.
 
-The board runs a free-running **GPT1** counter (75 MHz, 13.3 ns/tick, software-extended to 64 bit) as its only ruler. One line per event:
+Teensy GPIO accepts 0–3.3 V and is not 5 V tolerant. RS-232 must pass through the
+MAX3232. U501–U503 accept the 5 V signals and output 3.3 V logic; their inputs are
+specified up to 5.5 V. ([PJRC](https://www.pjrc.com/store/teensy41.html),
+[TI](https://www.ti.com/product/SN74LVC2G17))
 
-| Line | Meaning |
+U401 supplies approximately 9 V trigger pulses. Confirm the actual camera's input
+voltage/current requirements; its low-going edge depends on the 4.7 kΩ pull-down,
+cable capacitance and camera load. Measure both edges and the pulse width at the
+camera connector. The MCU's 5 V rail comes from USB through the Teensy's normal
+VUSB–VIN connection; the schematic's 12 V input supplies the trigger driver through
+U402. Do not treat a 12 V connection alone as MCU power.
+
+## Timing model
+
+GPT1 runs at nominally 75 MHz, software-extended to 64 bits across its approximately
+57.3 s rollover. One output compare schedules the earliest pending edge among all
+four channels. Each channel retains its own period, phase and pulse width; there
+is no allocation or unbounded waiting in the interrupt handler.
+
+The default pulse width is 50 µs, timed from the sampled GPIO rise. A delayed ISR
+may lengthen a pulse. Completely missed pulse windows are skipped and counted;
+missed periods are not compressed into a burst. If the scheduler cannot make
+progress within its bounded work limit, outputs are parked and `stall` increments.
+A STOP followed by START resets the scheduler.
+
+Current log timestamps mean:
+
+| Stream | Timestamp meaning |
 |---|---|
-| `#SESSION,START,<path>` | session begin (`<path>` = where the host says it saves the log) |
-| `#LOG,SensorSync-logger,1,tick_hz=<f>` | header; `cap=<0\|1>` appended in hardware-capture builds |
-| `#TRIG,<i>,<name>,<pin>,<freq>,ah=<0\|1>` | one per trigger channel |
-| `#STROBE,<i>,<name>,<pin>,ah=<0\|1>` | one per strobe channel |
-| `P,<seq>,<tick>` | PPS edge |
-| `T,<seq>,<ch>,<level>,<tick>` | trigger edge (`tick` = exact GPT1 compare value) |
-| `S,<seq>,<ch>,<level>,<tick>` | strobe / exposure-active edge |
-| `Z,<seq>,<tick>,<raw NMEA>` | ToD sentence + read-out tick |
-| `#H` / `#Ht` / `#Hs` | health, every 5 s while running (fields below) |
-| `#SESSION,STOP,<path>` | session end (queued events are drained first) |
-| `#IDLE,up=<ms>` | heartbeat while idle between sessions |
-| `#ERR,unknown_command,<cmd>` | unrecognized command echo |
+| `P` | GPIO PPS ISR sample |
+| `T` | GPT sample immediately after the GPIO output write |
+| `S` | GPIO exposure ISR sample |
+| `Z` | Time when the NMEA terminator is read by the main loop |
 
-`<seq>` is per-stream, **starts at 1 each session**, and advances even on a drop — any gap is visible. Triggers free-run off a periodic GPT1 compare (not GNSS-aligned); their exact compare ticks are logged, so the host still recovers precise GNSS times.
+The 13.3 ns tick is **resolution, not guaranteed accuracy**. ISR latency, GPIO write
+completion, sequential channel handling and external circuitry all contribute
+measurement error. PPS fitting corrects the clock scale/drift; it cannot remove
+these path delays. The current firmware uses GPIO PPS only; no hardware-capture
+switch or self-test is provided. Older logs used scheduled compare values for most
+`T` records; check their `#TIME` declaration before comparing latency measurements.
 
-## Session API
+## Build and flash
 
-The board **boots idle** and logs nothing until told to start. One session = one acquisition run. Commands are newline-terminated over USB serial (115200; the USB CDC baud is nominal — any rate works, keep tools consistent):
+With PlatformIO installed:
 
-| Command | Action |
-|---|---|
-| `START [freq=CH:HZ,...] [path]` | zero every counter, optionally retune trigger rates, enable triggers + capture, emit `#SESSION,START` + header, stream data. A `START` during a run first closes it with a paired `#SESSION,STOP`. |
-| `STOP` | drain queued events, emit `#SESSION,STOP`, park idle, clear counts. Idle `STOP` just answers `#IDLE`. |
-| `s` (or `STATUS`) | `#H` health if running, else `#IDLE` |
-| `h` (or `HEADER`) | reprint the `#LOG/#TRIG/#STROBE` header |
+```bash
+./upload.bash -b        # build only
+./upload.bash           # build, flash, then check the idle banner
+```
 
-`<path>` is **echo-only** — the board cannot write the host filesystem; the *host* saves the stream. Keywords are token-matched, so a garbled line (`STOPPED`, `STARTx`) cannot toggle session state.
+`upload.bash` refuses to flash while a reader holds the port. It selects the CLI
+loader when no DISPLAY is set. `pio run` builds the default environment;
+`pio run -e teensy41_cli` builds the headless upload environment.
 
-**Per-run trigger rates** — exposure time is only known in the field, so the fitting trigger frequency is a `START` option, not a rebuild: `START freq=0:25.5,2:0 /data/run7.log` retunes trig[0] to 25.5 Hz and switches trig[2] off; omitted channels keep their `config.h` rates. Overrides persist until the next override or reboot, the `#TRIG` header always echoes the **effective** rates (verify there), and an invalid entry answers `#ERR,bad_freq,...` while keeping the old rate. Because the rates ride inside `START`, a watchdog re-`START` after a board reboot restores them automatically.
+The GPT timebase changes the shared peripheral clock. Do not add IntervalTimer or
+other PIT users that assume the original 24 MHz clock without revisiting this setup.
 
-### Drive it from your acquisition program
+On Linux, install [PJRC's udev rules](https://www.pjrc.com/teensy/00-teensy.rules)
+and grant the recording user serial-port access (normally the `dialout` group).
+An acquisition host needs a C++20 compiler to build the recorder, but does not need
+PlatformIO unless it also builds/flashes firmware.
 
-**C++** — integrate [`session_client.cpp`](session_client.cpp) (POSIX termios, no deps):
+## Recording
+
+Build the shared C++ client once, and rebuild it after source changes:
+
+```bash
+g++ -std=c++20 -O2 -pthread -DSESSION_CLIENT_DEMO session_client.cpp -o session_client
+./session_client /dev/ttyACM0 /tmp/run.log 5 25
+# Arguments: port, new log path, seconds (0 = until signal), trig0 Hz or freq=ch:hz,...
+```
+
+The client creates a new file exclusively, waits for START acknowledgement, and
+on SIGINT/SIGTERM sends STOP, waits for final health and STOP acknowledgement, then
+flushes and synchronizes the file. A USB disconnect, reboot, unexpected IDLE,
+repeated START, protocol error or reported loss fails the run. It does not reconnect
+or restart the board automatically; end the associated camera acquisition epoch.
+The standalone client exits nonzero on failure.
+
+`record_ctl.bash` uses this same executable and protocol handling:
+
+```bash
+export SENSOR_PORT=/dev/serial/by-id/usb-Teensyduino_... # replace with the actual port
+LOG=$(./record_ctl.bash start /data/logs 0:25.5) || exit 1
+./record_ctl.bash status
+# ... acquire camera data ...
+./record_ctl.bash stop || exit 1
+```
+
+`start` prints a unique absolute log path only after the START acknowledgement.
+`stop` reports success only after the client has validated STOP and finalized the
+file; an unconfirmed or lossy run returns nonzero. `new` stops the previous run and
+starts another only if the previous run completed successfully. No automatic START
+is issued during recovery or stopping. A failed run's state remains available until
+`stop` collects the result. Sidecars `<log>.status` and `<log>.stderr` retain the
+recorder result and diagnostics.
+
+`SENSOR_PORT` selects the port explicitly. If unset, exactly one Teensy by-id port
+(or one ttyACM fallback) must exist. `SESSION_CLIENT` overrides the executable path;
+`RECORD_STATE` overrides `/tmp/sensorsync_record.state`. Keep one reader per port;
+do not run a monitor or a second recorder alongside it.
+
+For C++ integration, include `session_client.cpp` without `SESSION_CLIENT_DEMO`:
 
 ```cpp
 SensorSyncSession s;
-s.open("/dev/serial/by-id/usb-Teensyduino_...");  // by-id survives re-enumeration
-s.start("/data/logs/run_0007.log",    // one file per run, counts from 0
-        {{0, 25.0}, {1, 2.0}});       // field-decided trigger Hz ({ch,0} = off; optional)
-// ... acquisition ...
-s.stop();                             // board -> idle
+if (!s.open(port) || !s.start(log_path, {{0, 25.0}, {1, 25.0}, {2, 5.0}, {3, 5.0}})) {
+    // Abort camera acquisition: timing session did not start successfully.
+}
+// During acquisition, poll s.ok(); end the camera epoch if it becomes false.
+s.stop();
+if (!s.ok()) {
+    // Preserve the log for diagnosis; the run did not complete cleanly.
+}
 ```
 
-Mid-run recovery is built in: if the port drops (USB glitch or board reboot) the reader re-opens it and keeps appending to the same file, and a watchdog that sees `#IDLE` in the stream re-sends `START` (rate-limited, muted during `stop()`) — so a rebooted board resumes as a second `#SESSION,START` in the same file, which `postprocess.py` splits.
+## Board protocol and configuration
 
-Demo build: `g++ -std=c++17 -O2 -pthread -DSESSION_CLIENT_DEMO session_client.cpp -o session_client`, then `./session_client /dev/ttyACM0 /tmp/run.log 5 25` (last arg = trig[0] Hz, optional).
+USB CDC commands are newline-terminated; 115200 is a nominal USB baud setting.
+The board boots idle. `config.h` contains pins, defaults, pulse widths, phases and
+interrupt priorities.
 
-**Shell / Python** — [`record_ctl.bash`](record_ctl.bash) wraps the same protocol; each `start` creates `logs/session_<timestamp>.log` and prints its path:
+| Command | Action |
+|---|---|
+| `START [freq=CH:HZ,...] [path]` | Close any old session, reset counts, emit header, start capture |
+| `STOP` | Disable outputs/capture, drain queued events, emit final health and STOP |
+| `s` or `STATUS` | Health while running; IDLE otherwise |
+| `h` or `HEADER` | Reprint the current channel and timebase configuration |
 
-```bash
-LOG=$(./record_ctl.bash start /data/logs 0:25.5)   # begin at 25.5 Hz; path on stdout
-# ... acquisition ...
-./record_ctl.bash stop
-python3 postprocess.py "$LOG" -o "${LOG%.log}.csv" --gps
-```
+A frequency of 0 disables a channel. Enabled rates must be finite and at least
+1 Hz; periods must exceed the scheduler's timing margin. Omitted channels retain
+their previous effective rate until reboot. Invalid values emit `#ERR,bad_freq`
+and retain the old rate. Check `#TRIG` for the effective quantized rate. The path
+is echo-only; it does not make the board write to the host filesystem.
 
-```python
-import subprocess
-log = subprocess.run(["./record_ctl.bash", "start", "/data/logs"],
-                     capture_output=True, text=True).stdout.strip()
-# ... acquisition ...
-subprocess.run(["./record_ctl.bash", "stop"])
-```
+| Record | Meaning |
+|---|---|
+| `#SESSION,START,<path>` / `#SESSION,STOP,<path>` | Session boundaries |
+| `#LOG,SensorSync-logger,1,tick_hz=<f>` | Nominal timebase frequency |
+| `#TRIG,<i>,<name>,<pin>,<freq>,ah=<0|1>` | Trigger configuration |
+| `#STROBE,<i>,<name>,<pin>,ah=<0|1>` | Exposure configuration |
+| `#TIME,...` | Timestamp sampling semantics |
+| `P,<seq>,<tick>` | PPS event |
+| `T,<seq>,<ch>,<level>,<tick>` | Trigger edge |
+| `S,<seq>,<ch>,<level>,<tick>` | Exposure edge |
+| `Z,<seq>,<tick>,<raw NMEA>` | Complete NMEA sentence |
+| `#H`, `#Ht`, `#Hs` | Periodic aggregate and per-channel health |
+| `#HFINAL ...` | Final aggregate counters before STOP |
+| `#IDLE,up=<ms>` | Idle heartbeat |
 
-`new` rotates (stop + start); `status` reports the file and port. A brief USB glitch reconnects and appends to the **same** file without re-`START` (seq stays continuous). If the board **reboots** mid-run, a watchdog re-sends `START`: a second `#SESSION,START` lands in the same file and `postprocess.py` splits the sessions.
+Sequence numbers start at 1 per stream/channel each session and advance on software
+queue/output drops. They do not count physical edges missed before the GPIO ISR or
+bytes lost before sentence assembly. Data output drops rather than blocking when
+USB has no space; the event rings do not guarantee a host-stall recording buffer.
 
-One reader per port — don't run a recorder and `pio device monitor` together.
-
-## Hardware
-
-![Teensy 4.1 ↔ FX10e trigger wiring](./resource/teensy_fx10e_trigger_wiring.svg)
-
-| Signal | Teensy pin | Notes |
-|---|---|---|
-| PPS in | 3 (or **48** for hardware capture) | rising edge |
-| NMEA in | 7 (RX2) | 115200 (`TOD_BAUD`); **RS-232 needs a MAX3232**, not a divider |
-| trig[0] `FX10E` | 24 | 50 Hz (per-channel rate in `config.h`) |
-| trig[1] `JAI` | 25 | 1 Hz |
-| trig[2] `SPARE` | 26 | 1 Hz |
-| strobe[0..2] | 39 / 40 / 41 | exposure-active read-back |
-
-- **Teensy 4.1 is 3.3 V and not 5 V tolerant.** Level-shift every camera/INS line.
-- Level shifters add a few µs, asymmetric on rise vs fall — measure and correct in post-processing.
-- Strobe inputs are biased toward the inactive level: an unpowered line reads "no exposure" instead of noise.
-
-## Build & flash
-
-[PlatformIO](https://platformio.org/):
-
-```bash
-./upload.bash           # one command: build + flash + boot check
-./upload.bash -b        # build only
-```
-
-`upload.bash` refuses to flash while a recorder holds the port, waits for the board to re-enumerate, and confirms the boot banner. On a headless machine (edge device / ssh, no `$DISPLAY`) it automatically switches to the `teensy-cli` loader. Manual equivalent: `pio run` / `pio run -t upload`.
-
-**Linux:** install the PJRC udev rules or ModemManager will hold the port (`sudo wget -O /etc/udev/rules.d/00-teensy.rules https://www.pjrc.com/teensy/00-teensy.rules && sudo udevadm control --reload-rules && sudo udevadm trigger`, then replug), and add yourself to the serial group (`sudo usermod -aG dialout $USER`, re-login).
-
-**Edge device (recording only):** the firmware runs on the Teensy, so a field box that only records needs **no PlatformIO at all** — just the udev rules + `dialout` above, then `record_ctl.bash` (pure bash) or `session_client.cpp` (any g++). Install PlatformIO (`python3 -m pip install --user platformio`) only if the device must also flash firmware; the first build downloads the toolchain and needs internet once.
-
-## Configuration
-
-Everything hardware-specific is in [`config.h`](config.h):
-
-| Setting | Default | Meaning |
-|---|---|---|
-| `TB_PERCLK_DIV` | 2 | GPT clock divider → 75 MHz, 13.3 ns/tick |
-| `PPS_PIN` / `PPS_RISING_EDGE` | 3 / 1 | PPS pin & active edge (48 for hardware capture) |
-| `TOD_INPUT_SERIAL` / `TOD_BAUD` | Serial2 / 115200 | NMEA input |
-| `TRIG_CFG[]` | — | per channel: name, pin, freq (≥ 1 Hz), phase, pulse width, active_high |
-| `STROBE_CFG[]` | — | per channel: name, pin, active_high |
-| `USE_HW_CAPTURE` | 0 | PPS via `GPT1_CAPTURE1` (needs PPS on pin 48); the main PPS-jitter lever |
-| `EVT_RING_SIZE` / `DRAIN_PER_LOOP` | 4096 / 96 | ISR→loop ring size / max lines per stream per `loop()` |
-
-Invalid trigger configs (< 1 Hz, period < 4× ISR margin, negative phase) are rejected **loudly** at boot and the channel disabled. There is **no** time-scale / GPS-offset / lag-window / lock config on the board — all of that lives in `postprocess.py`.
-
-### PPS hardware capture (`USE_HW_CAPTURE`)
-
-The single biggest data-quality lever: latches PPS in `GPT1_CAPTURE1` instead of a GPIO ISR, cutting timestamp jitter to one tick. Requires **PPS on pin 48** (`GPIO_EMC_24` ALT4 — the only capture pad on Teensy 4.1; enforced by `static_assert`). Bring-up: jumper `HW_SELFTEST_DRIVE_PIN` (31) → 48, set `USE_HW_CAPTURE 1` / `PPS_PIN 48`, leave `HW_PPS_DAISY` at `AUTO`; the boot self-test prints the working daisy value and **refuses to log fake PPS on failure** (also re-warned in every `#IDLE`, and `cap=0` appears in the `#LOG` header). Then hard-code the daisy, remove the jumper, set `HW_CAPTURE_SELFTEST 0`.
+Health fields include `pps`, `ppsdt` (last measured interval, not PPS age), `tod`,
+`todb`, `ppsdrops`, `todtrunc`, `tdrops`, `sdrops`, `host`, `skip`, and `stall`.
+Final health preserves loss counters before reset. The recorder rejects nonzero
+loss/skip/stall counters. STOP ends capture immediately, so an exposure still in
+progress can lack its closing edge; post-processing flags that observation.
 
 ## Post-processing
 
-Needs only NumPy.
+Requires Python and NumPy. Both the receiver's NMEA time scale and its PPS-label
+convention must be verified; neither is inferred from sentence proximity.
 
 ```bash
-python3 postprocess.py session.log -o frames.csv          # UTC/Unix seconds
-python3 postprocess.py session.log -o frames.csv --gps    # GPS seconds
-python3 postprocess.py session.log --window 10 --convention auto --edges edges.csv
+# Example only: use these values after verifying UTC labels following their PPS.
+python3 postprocess.py "$LOG" -o "${LOG%.log}.csv" --tod-scale utc --convention preceding
+# Add --gps --leap N for GPS output, replacing N with the verified GPS-UTC offset.
 ```
 
-| Option | Default | Meaning |
-|---|---|---|
-| `--window S` | 10 | centered fit window |
-| `--convention` | `auto` | ToD↔PPS pairing: `auto` (nearest, prints median lag) / `preceding` / `following` |
-| `-o FILE` | `frames.csv` | per-frame CSV output |
-| `--gps` | off | output GPS seconds instead of UTC/Unix |
-| `--leap N` | 18 | GPS−UTC offset applied by `--gps` |
-| `--link A:B,...` | same index | strobe→trigger channel map |
-| `--session N` | most-PPS session | which session of a multi-session file to process |
-| `--edges FILE` | — | also dump every edge's GNSS time |
+| Option | Meaning |
+|---|---|
+| `--tod-scale utc|gps` | Required: receiver calendar-field time scale |
+| `--convention preceding|following` | Required: which PPS the received label describes |
+| `--gps` | Output GPS seconds instead of UTC/Unix seconds |
+| `--leap N` | Explicit GPS−UTC offset; required for GPS input or output |
+| `--window S` | Fit window, default 10 s |
+| `--session N` | Required selection if a log contains multiple sessions |
+| `--link A:B,...` | Strobe-to-trigger map; default same channel index |
+| `--edges FILE` | Optional per-edge CSV |
+| `-o FILE` | New per-frame CSV, default `frames.csv`; existing files are not overwritten |
 
-**Per-frame CSV**: `strobe,name,frame,start_sec,start_ns,end_sec,end_ns,mid_sec,mid_ns,dur_us,trig_sec,trig_ns,latency_us,fit_rms_ns,n_anchors,start_seq,trig_seq,flags`. `latency_us` = exposure start − matched trigger command. Flags: `0x02` no trigger matched (or trigger fit failed), `0x04` exposure suspect (an edge was lost nearby), `0x08` non-centered fit (session edge or anchor gap — trust it less).
+The fit uses small numeric offsets to preserve timestamp precision. A centered
+result requires coverage of the full requested window, retained anchors before
+and after the event, and no missing-second gap among retained anchors. Session
+edges, sparse regions and rejected anchors may produce a valid but non-centered
+fit. Missing time coverage leaves affected output times blank.
 
-Stderr reports: per-stream dropped-edge counts (from seq gaps, including drops before the first surviving line), malformed-line count, anchor/lag summary, and multi-session splits.
+Trigger matching considers only triggers at or before exposure start, within half
+a trigger period. Out-of-window, duplicate-time or reused candidates stay unmatched.
+This remains a heuristic, not camera BlockID verification: `association_verified=0`.
+An exposure delayed beyond that window stays unmatched.
 
-## Health reference
+CSV includes start/end/midpoint, `dur_us`, matched trigger time, latency, fit RMS,
+anchor count, source sequences/ticks, flags, and the selected time-scale settings.
+`dur_us` and latency use the same calibrated times as the timestamp columns.
+Duration is blank unless both exposure endpoints have valid fits.
 
-`#H up=<ms> en=<0|1> pps=<n> ppsdt=<s> ppsdrops=<n> tod=<n> todb=<bytes> todtrunc=<n> tdrops=<n> sdrops=<n> host=<n>` — uptime, triggers enabled, PPS edges seen, last PPS interval, PPS ring drops, ToD sentences, ToD bytes, oversize ToD discards, trigger/strobe ring drops, host-stall line drops.
+| Flag | Meaning |
+|---|---|
+| `0x01` | Incomplete time fit |
+| `0x02` | No matched trigger time, or its fit failed |
+| `0x04` | Suspect exposure reconstruction near a lost edge |
+| `0x08` | Non-centered fit / incomplete window coverage |
+| `0x10` | Missing exposure end edge |
+| `0x40` | Log integrity incomplete or unverified |
 
-`#Ht <i> <name> n=<edges> skip=<periods> stall=<n>` per trigger channel (`stall` ≠ 0 = channel died arming, restart the session); `#Hs <i> <name> n=<edges>` per strobe channel.
+Fit RMS describes residuals; it is not an absolute timing-accuracy guarantee.
 
-## Bring-up & validation
+## Validation
 
-1. **Bare board** — flash; board idles (`#IDLE` heartbeats). Send `START`: expect `#SESSION,START`, the header, `#H` every 5 s with `pps=0` (no INS). `STOP` returns to `#IDLE`.
-2. **INS connected** — `pps=` and `tod=` climb ~1/s; `P`/`Z` lines appear; `T`/`S` lines stream at the trigger/exposure rates.
-3. **First post-process** — sane anchor count; median lag typically 100–400 ms for a `preceding` receiver.
-4. **Integer-second check** (most error-prone) — compare a frame's `start_sec` to trusted time; off by exactly 1 s ⇒ force `--convention` the other way.
-5. **Loopback** — jumper trig[2] (pin 26) → strobe[2] (pin 41): `latency_us` = full command-to-measurement path. Repeat on the highest-rate channel (`FX10E`, 50 Hz).
-6. **Gap / stall test** — pause the capturing host briefly: expect a seq gap in the log, `host=` climbing in `#H`, and `postprocess.py` reporting the exact loss.
+```bash
+python3 -m unittest discover -s tests -v
+./upload.bash -b
+```
 
-## Limitations
+Host regression tests exercise four-channel scheduling, wraparound, delayed ISRs,
+frame matching, fit coverage, calibrated duration, and recorder acknowledgements
+using a simulated serial port. They do not replace board measurements.
 
-- Trigger frequency must be **≥ 1 Hz** (whole-tick period) and well below the tick rate; triggers are **not** GNSS-aligned — only their logged ticks are exact.
-- Strobe (and software-mode PPS) timestamps carry GPIO-ISR jitter (~0.3–2 µs). Hardware capture removes it for PPS; strobe jitter is the per-frame floor.
-- The PPS↔whole-second-NMEA pairing has a fundamental ±1 s ambiguity; `--convention` decides it (nearest-PPS is correct when receiver latency < 0.5 s).
-- A centered fit needs PPS on both sides: the first/last window of a session is one-sided (flagged `0x08`).
+On the bench, check each camera separately before combining channels. Verify PPS
+and NMEA arrival, polarity, trigger voltage/pulse width, and the camera's accepted
+frame count. Run longer than 120 s to cross multiple GPT rollovers. Check the
+integer-second time against a trusted reference and measure the trigger/feedback
+path with the actual cables and camera load.
+
+For **bare Teensy only**, disconnect external drivers before jumpering GPIO 33 to
+GPIO 18 for a logic-level loopback. On the assembled board, the exposure buffer
+already drives GPIO 18; do not bridge two outputs. Never connect a 9 V camera
+trigger output directly to a Teensy pin. GPIO 41 is the schematic's 12 V sense
+input, not an exposure input.
 
 ## Files
 
-| File | Role |
-|---|---|
-| `SensorSync.ino` | setup/loop, session control, raw-log output, health |
-| `timebase.*` | GPT1 free-running 64-bit counter + optional PPS hardware capture |
-| `timesync.*` | PPS tick queue + raw NMEA assembly (no fit) |
-| `channels.*` | trigger generation + strobe capture + event rings |
-| `config.h` | all hardware-specific settings |
-| `postprocess.py` | offline pairing + centered fit + per-frame CSV |
-| `session_client.cpp` | C++ session client: `open` / `start` / `stop` + reader thread |
-| `record_ctl.bash` | shell session control: `start` / `stop` / `new` / `status` |
-| `upload.bash` | one-command build + flash + boot check |
-| `resource/` | wiring diagram |
-
-## License
+`SensorSync.ino` controls sessions and logging; `timebase.*` provides the GPT clock;
+`channels.*` schedules triggers and captures strobes; `timesync.*` queues PPS and
+assembles NMEA. `postprocess.py` converts logs. `session_client.cpp` and
+`session_protocol.h` implement host recording; `record_ctl.bash` manages its
+lifecycle. `upload.bash` builds/flashes; `tests/` contains host regression tests.
 
 Released under the [MIT License](LICENSE).

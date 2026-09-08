@@ -16,8 +16,8 @@ Only dependency: numpy.
 Usage requires explicitly verified --tod-scale (utc/gps) and --convention
 (preceding/following). GPS conversion also requires the applicable --leap.
 Output CSV rows describe strobe observations; they are not camera BlockIDs.
-T ticks normally describe scheduled compares (late fallback uses a software sample);
-S ticks are GPIO ISR samples. Fits do not remove physical interrupt/trigger latency.
+Current T ticks are samples immediately after GPIO writes; older logs use scheduled
+compares (see #TIME). S and P ticks are GPIO ISR samples. Fits do not remove path latency.
 """
 
 import argparse
@@ -342,6 +342,7 @@ class CenteredFitter:
         s0 = ys[0]
         x = (xt - t0).astype(np.float64)
         y = (ys - s0).astype(np.float64)
+        kept = xt.copy()
         floor = 5.0 / self.hz                    # ~5 ticks: don't reject on mere quantization
         for _ in range(2):
             if len(x) < 4:
@@ -353,17 +354,20 @@ class CenteredFitter:
             if m.all() or m.sum() < 4:
                 break
             x, y = x[m], y[m]
+            kept = kept[m]
         b, a = np.polyfit(x, y, 1)
         r = y - (a + b * x)
         rms = float(np.sqrt(np.mean(r * r))) if len(r) else 0.0
-        return a, b, t0, s0, rms, len(x)
+        return a, b, t0, s0, rms, kept
 
     def gnss(self, tick):
         """Return (whole_sec_int, frac_float, rms_residual_s, n_anchors, ok, centered)."""
         lo = np.searchsorted(self.at, tick - self.half, 'left')
         hi = np.searchsorted(self.at, tick + self.half, 'right')
         xt, ys = self.at[lo:hi], self.asec[lo:hi]
-        centered = len(xt) >= self.min_pts and int(xt[0]) <= tick <= int(xt[-1])
+        centered = (len(xt) >= self.min_pts and
+                    int(self.at[0]) <= tick - self.half and
+                    int(self.at[-1]) >= tick + self.half)
         if len(xt) < self.min_pts:
             # widen to the nearest min_pts anchors (session edge / sparse region)
             centered = False
@@ -379,7 +383,14 @@ class CenteredFitter:
             return None, 0.0, 0.0, len(xt), False, False
         if min(abs(tick - int(t)) for t in xt) > self.half:
             return None, 0.0, 0.0, len(xt), False, False
-        a, b, t0, s0, rms, n = self._fit(xt, ys)
+        a, b, t0, s0, rms, kept = self._fit(xt, ys)
+        n = len(kept)
+        # Whole-second PPS need not coincide with the window limits. Allow one
+        # PPS spacing there, but flag missing seconds and one-sided retained fits.
+        centered = bool(centered and int(kept[0]) < tick < int(kept[-1]) and
+                        int(kept[0]) - (tick - self.half) <= 1.01 * self.hz and
+                        (tick + self.half) - int(kept[-1]) <= 1.01 * self.hz and
+                        np.all(np.diff(kept) <= 1.5 * self.hz))
         if not np.isfinite(a) or not np.isfinite(b) or not np.isfinite(rms) or b <= 0:
             return None, 0.0, 0.0, n, False, False
         rel = a + b * float(tick - t0)              # small-offset domain: no float64 abs-second
@@ -428,7 +439,7 @@ def exposures(edges, active_level):
 
 
 def match_frames(exps, trigs, half_period_ticks):
-    """Heuristic association within half a period; ambiguous/reused triggers stay unmatched."""
+    """Match only preceding triggers within half a period; duplicates/reuse stay unmatched."""
     tt = np.array([t for _, t in trigs], dtype=np.int64) if trigs else np.empty(0, np.int64)
     tseq = [s for s, _ in trigs]
     frames = []
@@ -436,20 +447,11 @@ def match_frames(exps, trigs, half_period_ticks):
         rec = dict(start_tick=s_tick, end_tick=e_tick, start_seq=s_seq,
                    trig_tick=None, trig_seq=None, suspect=suspect)
         if len(tt):
-            i = np.searchsorted(tt, s_tick)
-            best, bestd = None, None
-            tied = False
-            for j in (i - 1, i):
-                if 0 <= j < len(tt):
-                    d = abs(int(tt[j]) - s_tick)
-                    if bestd is None or d < bestd:
-                        bestd, best = d, j
-                        tied = False
-                    elif d == bestd:
-                        tied = True
-            if best is not None and not tied and half_period_ticks > 0 and bestd <= half_period_ticks:
-                rec['trig_tick'] = int(tt[best])
-                rec['trig_seq'] = tseq[best]
+            i = int(np.searchsorted(tt, s_tick, side='right')) - 1
+            duplicate = i > 0 and tt[i - 1] == tt[i]
+            if i >= 0 and not duplicate and half_period_ticks > 0 and s_tick - int(tt[i]) <= half_period_ticks:
+                rec['trig_tick'] = int(tt[i])
+                rec['trig_seq'] = tseq[i]
         frames.append(rec)
     counts = {}
     for rec in frames:
@@ -613,8 +615,7 @@ def main():
                     mfl = int(np.floor(mrel))
                     ms, ns = split(to_out(sw + mfl), mrel - mfl)
                     mns = f"{ns:09d}"
-                if fr['end_tick'] is not None:
-                    dur_us = f"{(fr['end_tick'] - fr['start_tick']) * 1e6 / lg.tick_hz:.3f}"
+                    dur_us = f"{((ew - sw) + (ef - sf)) * 1e6:.3f}"
                 trig_out = tr_ns = ''
                 lat_us = ''
                 tseq = fr['trig_seq'] if fr['trig_seq'] is not None else ''

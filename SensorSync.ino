@@ -10,7 +10,7 @@
 //    #TRIG,<i>,<name>,<pin>,<freq>,ah=<0|1>        per trigger channel
 //    #STROBE,<i>,<name>,<pin>,ah=<0|1>             per strobe channel
 //    P,<seq>,<tick>                                PPS edge
-//    T,<seq>,<ch>,<level>,<tick>                   trigger edge (tick = compare value)
+//    T,<seq>,<ch>,<level>,<tick>                   trigger edge (sample after GPIO write)
 //    S,<seq>,<ch>,<level>,<tick>                   strobe edge
 //    Z,<seq>,<tick>,<raw NMEA sentence>            ToD sentence + read-out tick
 //    #H / #Ht / #Hs                                health, every 5 s while running
@@ -34,29 +34,15 @@ static char g_session_path[224] = { 0 };  // >= max cmd payload; no truncation
 
 // ---------------------------------------------------------------------------
 // PPS input
-#if !USE_HW_CAPTURE
+
 static void ppsIsr() {
 	if (g_running) {  // gate: no counting while idle
 		timesync::onPpsEvent(timebase::now());
 	}
 }
-#endif
-
-#if USE_HW_CAPTURE
-static_assert(PPS_PIN == 48, "USE_HW_CAPTURE=1 requires PPS on pin 48; GPIO_EMC_24 is the only GPT1_CAPTURE1 pad on Teensy 4.1");
-// Gate for gptHook's IF1 forwarding: failed capture never fabricates PPS.
-static bool g_capture_ok = false;
-#endif
 
 // GPT1 status word forwarded from the timebase ISR
-static void gptHook(uint32_t sr, uint32_t icr1) {
-#if USE_HW_CAPTURE
-	if (g_running && g_capture_ok && (sr & SS_GPT_SR_IF1)) {
-		timesync::onPpsEvent(timebase::extend(icr1));
-	}
-#else
-	(void) icr1;
-#endif
+static void gptHook(uint32_t sr) {
 	channels::gptIsr(sr);
 }
 
@@ -133,11 +119,7 @@ static void printHeader() {
 	if (!waitTx(512, 250)) {  // all lines fit in 512 B once room exists
 		return;
 	}
-#if USE_HW_CAPTURE
-	Serial.printf("#LOG,SensorSync-logger,1,tick_hz=%.3f,cap=%d\n", timebase::nominalHz(), g_capture_ok ? 1 : 0);
-#else
 	Serial.printf("#LOG,SensorSync-logger,1,tick_hz=%.3f\n", timebase::nominalHz());
-#endif
 	for (uint8_t i = 0; i < TRIG_MAX; i++) {
 		// effective rate: config.h default, or the session's freq= override
 		Serial.printf("#TRIG,%u,%s,%u,%.4f,ah=%u\n", i, TRIG_CFG[i].name, TRIG_CFG[i].pin, channels::freqHz(i),
@@ -147,7 +129,7 @@ static void printHeader() {
 		Serial.printf("#STROBE,%u,%s,%u,ah=%u\n", i, STROBE_CFG[i].name, STROBE_CFG[i].pin, STROBE_CFG[i].active_high ? 1 : 0);
 	}
 	if (waitTx(160, 250)) {
-		Serial.println("#TIME,T=scheduled_compare_or_late_fallback,S=GPIO_ISR_sample,Z=sentence_read,P=capture_or_ISR_per_build");
+		Serial.println("#TIME,T=GPIO_write_sample,S=GPIO_ISR_sample,Z=sentence_read,P=GPIO_ISR_sample");
 	}
 }
 
@@ -158,11 +140,6 @@ static void printIdle() {
 		return;
 	}
 	Serial.printf("#IDLE,up=%lu\n", (unsigned long) millis());
-#if USE_HW_CAPTURE
-	if (!g_capture_ok) {  // keep a boot-time capture failure visible to a late-attaching host
-		Serial.println("# !! GPT1_CAPTURE1 self-test FAILED at boot -- PPS will NOT be logged");
-	}
-#endif
 }
 
 
@@ -349,27 +326,9 @@ void setup() {
 	timebase::begin();
 	timebase::setIsrHook(gptHook);
 
-#if USE_HW_CAPTURE
-	{
-		uint8_t used = 0;
-		const uint8_t drive = HW_CAPTURE_SELFTEST ? (uint8_t) HW_SELFTEST_DRIVE_PIN : (uint8_t) 0xFF;
-		g_capture_ok = timebase::setupCapture1(PPS_RISING_EDGE ? true : false, (uint8_t) HW_PPS_DAISY, drive, used);
-		if (g_capture_ok) {
-			Serial.printf("# hw capture OK: pin %d (GPIO_EMC_24 ALT4), daisy=%u\n", (int) PPS_PIN, (unsigned) used);
-			if (HW_PPS_DAISY == HW_PPS_DAISY_AUTO) {
-				Serial.printf("# -> pin HW_PPS_DAISY to %u, then remove the jumper and set HW_CAPTURE_SELFTEST 0\n", (unsigned) used);
-			}
-		} else {
-			Serial.println("# !! FATAL: GPT1_CAPTURE1 self-test FAILED -- PPS will NOT be logged");
-			Serial.printf("# !!   is PPS on pin %d? is the self-test jumper %d -> %d fitted?\n", (int) PPS_PIN,
-						  (int) HW_SELFTEST_DRIVE_PIN, (int) PPS_PIN);
-		}
-	}
-#else
 	// bias to idle level: floating PPS line reads quiet, not noisy
 	pinMode(PPS_PIN, PPS_RISING_EDGE ? INPUT_PULLDOWN : INPUT_PULLUP);
 	attachInterrupt(digitalPinToInterrupt(PPS_PIN), ppsIsr, PPS_RISING_EDGE ? RISING : FALLING);
-#endif
 
 	timesync::begin();
 	channels::begin();

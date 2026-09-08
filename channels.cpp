@@ -9,18 +9,19 @@
 namespace channels {
 
 	// ---------------------------------------------------------------------------
-	// GPT1 output-compare helpers (software trigger generation)
-	static_assert(TRIG_MAX <= 3, "GPT1 has only 3 output compare channels");
-
-	static volatile uint32_t *ocrPtr(const uint8_t ch) {
-		return (ch == 0) ? &GPT1_OCR1 : (ch == 1) ? &GPT1_OCR2 : &GPT1_OCR3;
-	}
-	static uint32_t ofFlag(const uint8_t ch) {
-		return (ch == 0) ? SS_GPT_SR_OF1 : (ch == 1) ? SS_GPT_SR_OF2 : SS_GPT_SR_OF3;
-	}
-	static uint32_t ofIe(const uint8_t ch) {
-		return (ch == 0) ? SS_GPT_IR_OF1IE : (ch == 1) ? SS_GPT_IR_OF2IE : SS_GPT_IR_OF3IE;
-	}
+	// One compare wakes the scheduler for the earliest edge of any wired channel.
+	static_assert(TRIG_MAX > 0 && TRIG_MAX <= 4, "scheduler supports 1..4 trigger channels");
+	static_assert([] {
+		for (uint8_t i = 0; i < TRIG_MAX; ++i) {
+			if (!TRIG_CFG[i].name || TRIG_CFG[i].pin >= CORE_NUM_DIGITAL ||
+			    TRIG_CFG[i].pin == 0 || TRIG_CFG[i].pin == 1 || TRIG_CFG[i].pin == PPS_PIN) return false;
+			for (uint8_t j = 0; j < i; ++j)
+				if (TRIG_CFG[i].pin == TRIG_CFG[j].pin) return false;
+			for (uint8_t j = 0; j < STROBE_MAX; ++j)
+				if (TRIG_CFG[i].pin == STROBE_CFG[j].pin) return false;
+		}
+		return true;
+	}(), "trigger pins must be unique and must not overlap Serial1, PPS or strobes");
 
 
 	// ---------------------------------------------------------------------------
@@ -30,6 +31,7 @@ namespace channels {
 		uint64_t width_ticks;
 		uint64_t phase_ticks;
 		uint64_t rise_tick;		 // absolute tick of the current/next rising edge
+		uint64_t fall_tick;       // sampled rise + pulse width
 		volatile uint8_t stage;	 // 0 = rise scheduled, 1 = fall scheduled
 		bool cfg_ok;			 // config validated in begin() (else channel disabled)
 	};
@@ -54,7 +56,7 @@ namespace channels {
 	static volatile uint16_t g_trigq_head = 0, g_trigq_tail = 0;
 	static volatile uint32_t g_trig_seq[TRIG_MAX] = { 0 };
 	static volatile uint32_t g_skipped[TRIG_MAX] = { 0 };
-	static volatile uint32_t g_stalled[TRIG_MAX] = { 0 };  // armRise gave up; channel dead until next START
+	static volatile uint32_t g_stalled[TRIG_MAX] = { 0 };  // scheduler overload; outputs parked until next START
 	static volatile uint32_t g_trig_drops = 0;
 
 	static volatile Evt g_strobeq[EVT_RING_SIZE];
@@ -139,79 +141,83 @@ namespace channels {
 	}
 
 
-	// Write a 32-bit compare and read back to confirm it is still in the future.
-	// With FRR=1 the GPT compares for EQUALITY, so a value that just passed will not match again for a full 2^32 lap.
-	static bool armCompare(const uint8_t ch, const uint64_t tick) {
-		*ocrPtr(ch) = static_cast<uint32_t>(tick & 0xFFFFFFFFULL);
-		GPT1_SR = ofFlag(ch);
-		GPT1_IR |= ofIe(ch);
-		const uint32_t cnt = GPT1_CNT;
-		return static_cast<int32_t>(cnt - static_cast<uint32_t>(tick)) < 0;
+	// Catch up without compressing missed trigger periods into a burst.
+	static void advanceRise(const uint8_t ch, const uint64_t deadline) {
+		TrigState &s = g_trig[ch];
+		if (s.rise_tick <= deadline) {
+			const uint64_t n = (deadline - s.rise_tick) / s.period_ticks + 1;
+			s.rise_tick += n * s.period_ticks;
+			g_skipped[ch] += static_cast<uint32_t>(n);
+		}
 	}
 
+	static uint64_t nextEdge(const TrigState &s) {
+		return s.stage ? s.fall_tick : s.rise_tick;
+	}
 
-	// Catch rise_tick up to the future (if the ISR fell behind) and arm the rising edge
-	static void armRise(const uint8_t ch) {
+	static void serviceEdge(const uint8_t ch, const uint64_t now) {
 		TrigState &s = g_trig[ch];
-		s.stage = 0;
-		for (int attempt = 0; attempt < 8; attempt++) {
-			const uint64_t deadline = timebase::now() + g_margin_ticks;
-			if (static_cast<int64_t>(s.rise_tick - deadline) <= 0) {
-				const uint64_t behind = deadline - s.rise_tick;
-				const uint64_t n = behind / s.period_ticks + 1;
-				s.rise_tick += n * s.period_ticks;
-				g_skipped[ch] += static_cast<uint32_t>(n);
-			}
-			if (armCompare(ch, s.rise_tick)) {
+		if (!s.stage) {
+			if (now >= s.rise_tick + s.width_ticks) {
+				// The entire intended pulse window passed. Skip it rather than emit a runt.
+				advanceRise(ch, now + g_margin_ticks);
 				return;
 			}
-			// slipped past while writing the OCR: advance one period, retry
+			digitalWriteFast(TRIG_CFG[ch].pin, activeLevel(ch));
+			const uint64_t tick = timebase::now();
+			pushTrig(ch, activeLevel(ch), tick);
+			s.fall_tick = tick + s.width_ticks;
+			s.stage = 1;
+		} else {
+			setIdle(ch);
+			pushTrig(ch, idleLevel(ch), timebase::now());
+			s.stage = 0;
 			s.rise_tick += s.period_ticks;
-			g_skipped[ch]++;
+			advanceRise(ch, timebase::now() + g_margin_ticks);
 		}
-		// give up (unreachable for valid configs: period >= 4*margin makes the
-		// 2nd attempt always land clear). Counted -> visible as stall= in #Ht.
-		GPT1_IR &= ~ofIe(ch);
-		g_stalled[ch]++;
 	}
 
-
-	// GPT1 interrupt (forwarded by timebase)
-	void gptIsr(const uint32_t sr) {
-		if (!g_enabled) {
-			return;
-		}
-		const uint32_t ie = GPT1_IR;
-		for (uint8_t i = 0; i < TRIG_MAX; i++) {
-			if (!g_trig[i].cfg_ok) {
-				continue;
-			}
-			if (!(sr & ofFlag(i)) || !(ie & ofIe(i))) {
-				continue;
-			}
-			TrigState &s = g_trig[i];
-			const TriggerCfg &c = TRIG_CFG[i];
-
-			if (s.stage == 0) {	 // rising edge fired
-				digitalWriteFast(c.pin, activeLevel(i));
-				pushTrig(i, activeLevel(i), s.rise_tick);
-				s.stage = 1;
-				if (!armCompare(i, s.rise_tick + s.width_ticks)) {
-					// fall slipped past: leaving it would pin the pin asserted for a
-					// full 2^32 lap -> drop in software now, log the ACTUAL fall time
-					// (the scheduled tick would understate the stretched pulse)
-					digitalWriteFast(c.pin, idleLevel(i));
-					pushTrig(i, idleLevel(i), timebase::now());
-					s.rise_tick += s.period_ticks;
-					armRise(i);
+	static void scheduleNext() {
+		// Bounded even for overload or a compare passed during the register write.
+		for (unsigned attempt = 0; attempt < 2 * TRIG_MAX + 8; ++attempt) {
+			uint8_t ch = TRIG_MAX;
+			uint64_t tick = UINT64_MAX;
+			for (uint8_t i = 0; i < TRIG_MAX; ++i) {
+				if (g_trig[i].cfg_ok && nextEdge(g_trig[i]) < tick) {
+					ch = i;
+					tick = nextEdge(g_trig[i]);
 				}
-			} else {  // falling edge fired
-				digitalWriteFast(c.pin, idleLevel(i));
-				pushTrig(i, idleLevel(i), s.rise_tick + s.width_ticks);
-				s.rise_tick += s.period_ticks;
-				armRise(i);
 			}
+			if (ch == TRIG_MAX) {
+				GPT1_IR &= ~SS_GPT_IR_OF1IE;
+				return;
+			}
+			const uint64_t now = timebase::now();
+			if (tick <= now) {
+				serviceEdge(ch, now);
+				continue;
+			}
+			GPT1_OCR1 = static_cast<uint32_t>(tick);
+			GPT1_SR = SS_GPT_SR_OF1;
+			GPT1_IR |= SS_GPT_IR_OF1IE;
+			// GPT compares equality. Never leave a passed compare armed for a full wrap.
+			if (static_cast<int32_t>(GPT1_CNT - static_cast<uint32_t>(tick)) < 0) return;
 		}
+		// Overload: park every output and report the failure; a new START can recover.
+		GPT1_IR &= ~SS_GPT_IR_OF1IE;
+		for (uint8_t i = 0; i < TRIG_MAX; ++i) {
+			if (!g_trig[i].cfg_ok) continue;
+			if (g_trig[i].stage) {
+				setIdle(i);
+				pushTrig(i, idleLevel(i), timebase::now());
+			}
+			g_trig[i].stage = 0;
+			++g_stalled[i];
+		}
+	}
+
+	void gptIsr(const uint32_t sr) {
+		if (g_enabled && (sr & SS_GPT_SR_OF1) && (GPT1_IR & SS_GPT_IR_OF1IE)) scheduleNext();
 	}
 
 
@@ -239,57 +245,50 @@ namespace channels {
 		}
 		__disable_irq();
 		if (on) {
-			GPT1_SR = ofFlag(0) | ofFlag(1) | ofFlag(2);  // drop stale flags
+			GPT1_SR = SS_GPT_SR_OF1;
 			g_enabled = true;
-			// 4x margin: covers the arm sequence for all channels before the first compare
 			const uint64_t start = timebase::now() + g_margin_ticks * 4;
-			for (uint8_t i = 0; i < TRIG_MAX; i++) {
-				if (!g_trig[i].cfg_ok) {
-					continue;
-				}
+			for (uint8_t i = 0; i < TRIG_MAX; ++i) {
+				g_trig[i].stage = 0;
 				g_trig[i].rise_tick = start + g_trig[i].phase_ticks;
-				armRise(i);
 			}
+			scheduleNext();
 		} else {
 			g_enabled = false;
-			for (uint8_t i = 0; i < TRIG_MAX; i++) {
-				GPT1_IR &= ~ofIe(i);
-				setIdle(i);
-			}
+			GPT1_IR &= ~SS_GPT_IR_OF1IE;
+			for (uint8_t i = 0; i < TRIG_MAX; ++i) setIdle(i);
 		}
 		__enable_irq();
 	}
 
 
 	// Validate + program period/width/phase for channel i at `hz`. Warns loudly and
-	// returns false on reject, leaving the old timing intact. hz <= 0 = silent off.
-	// Rules: freq >= 1 Hz (whole-tick period), period >= 4*margin (armRise safety),
+	// returns false on reject, leaving the old timing intact. hz == 0 = silent off.
+	// Rules: freq >= 1 Hz (whole-tick period), period >= 4*margin (scheduler margin),
 	// phase >= 0 (stagger, folded modulo the period).
 	static bool configFreq(const uint8_t i, const double hz) {
 		const double nom = timebase::nominalHz();
 		const TriggerCfg &c = TRIG_CFG[i];
-		if (hz <= 0.0) {
+		if (hz == 0.0) {
 			return false;  // configured off, not an error
 		}
-		if (hz < 1.0) {
-			Serial.printf("# !! WARNING: trig[%u] %s freq=%.4fHz < 1 Hz unsupported; channel DISABLED\n", i, c.name, hz);
+		if (!std::isfinite(hz) || hz < 1.0) {
+			Serial.printf("# !! WARNING: trig[%u] %s freq=%.4fHz must be finite and >= 1 Hz; channel DISABLED\n", i, c.name, hz);
 			return false;
 		}
-		// floor of 2 keeps the bound meaningful even if margin truncates to 0
-		// (possible at very low tick rates via TB_PRESCALER)
-		const uint64_t min_period = (g_margin_ticks * 4 > 2) ? g_margin_ticks * 4 : 2;
+		const uint64_t min_period = g_margin_ticks * 4;
 		const auto period = static_cast<uint64_t>(llround(nom / hz));
 		if (period < min_period) {
 			Serial.printf("# !! WARNING: trig[%u] %s freq=%.4fHz too fast (period < %llu ticks); channel DISABLED\n", i, c.name, hz,
 						  static_cast<unsigned long long>(min_period));
 			return false;
 		}
-		if (c.phase_s < 0.0) {
-			Serial.printf("# !! WARNING: trig[%u] %s phase_s=%.4f < 0 unsupported; channel DISABLED\n", i, c.name, c.phase_s);
+		if (!std::isfinite(c.phase_s) || c.phase_s < 0.0) {
+			Serial.printf("# !! WARNING: trig[%u] %s invalid phase_s=%.4f; channel DISABLED\n", i, c.name, c.phase_s);
 			return false;
 		}
 		g_trig[i].period_ticks = period;
-		g_trig[i].width_ticks = static_cast<uint64_t>(c.pulse_us * 1e-6 * nom);
+		g_trig[i].width_ticks = static_cast<uint64_t>(llround(c.pulse_us * 1e-6 * nom));
 		if (g_trig[i].width_ticks < g_margin_ticks) {
 			// must outlast the ISR path to the fall
 			Serial.printf("# !! WARNING: trig[%u] %s pulse widened %lluus -> %.1fus (ISR margin)\n", i, c.name,
@@ -302,8 +301,8 @@ namespace channels {
 						  (unsigned long long) c.pulse_us);
 			g_trig[i].width_ticks = period / 2;
 		}
-		// fold keeps rise targets < 2^31 ticks ahead, which armCompare relies on
-		g_trig[i].phase_ticks = static_cast<uint64_t>(c.phase_s * nom) % period;
+		// Fold keeps targets within the signed 32-bit compare horizon (rates >= 1 Hz).
+		g_trig[i].phase_ticks = static_cast<uint64_t>(llround(std::fmod(c.phase_s, period / nom) * nom)) % period;
 		return true;
 	}
 
@@ -314,7 +313,8 @@ namespace channels {
 		if (ch >= TRIG_MAX || g_enabled) {
 			return false;
 		}
-		if (hz <= 0.0) {  // deliberate off
+		if (!std::isfinite(hz) || hz < 0.0) return false;
+		if (hz == 0.0) {  // deliberate off
 			g_trig[ch].cfg_ok = false;
 			g_freq_eff[ch] = 0.0;
 			return true;
@@ -323,7 +323,7 @@ namespace channels {
 			return false;  // rejected: old rate kept
 		}
 		g_trig[ch].cfg_ok = true;
-		g_freq_eff[ch] = hz;
+		g_freq_eff[ch] = timebase::nominalHz() / g_trig[ch].period_ticks;
 		return true;
 	}
 
@@ -335,6 +335,7 @@ namespace channels {
 	void begin() {
 		const double nom = timebase::nominalHz();
 		g_margin_ticks = static_cast<uint64_t>(nom * 5e-6);	 // 5 us
+		if (g_margin_ticks == 0) g_margin_ticks = 1;
 
 		for (uint8_t i = 0; i < TRIG_MAX; i++) {
 			memset(&g_trig[i], 0, sizeof(TrigState));
@@ -342,15 +343,15 @@ namespace channels {
 			g_skipped[i] = 0;
 			g_stalled[i] = 0;
 			g_trig[i].cfg_ok = configFreq(i, TRIG_CFG[i].freq_hz);
-			g_freq_eff[i] = g_trig[i].cfg_ok ? TRIG_CFG[i].freq_hz : 0.0;
+			g_freq_eff[i] = g_trig[i].cfg_ok ? nom / g_trig[i].period_ticks : 0.0;
 			pinMode(TRIG_CFG[i].pin, OUTPUT);
 			setIdle(i);
 		}
 
 		for (uint8_t i = 0; i < STROBE_MAX; i++) {
 			g_strobe_seq[i] = 0;
-			// Bias toward the inactive level, so a floating/unpowered line reads idle instead
-			// of making the ISR free-run on noise and flooding the event ring.
+			// Bias bare-board inputs. The PCB buffer overrides this pull;
+			// its external camera-side pull-up makes a disconnected camera read HIGH.
 			pinMode(STROBE_CFG[i].pin, STROBE_CFG[i].active_high ? INPUT_PULLDOWN : INPUT_PULLUP);
 		}
 		for (uint8_t i = 0; i < STROBE_MAX; i++) {
