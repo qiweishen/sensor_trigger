@@ -85,72 +85,10 @@ class PostprocessTests(unittest.TestCase):
             self.assertEqual(frames[1]['dur_us'], '')
             self.assertTrue(int(frames[1]['flags']) & 1)
 
-    def pwm_log(self, changes=None):
-        lines = ['#SESSION,START,pwm', '#LOG,SensorSync-logger,2,tick_hz=75000000',
-                 '#TIME,T=PWM_ISR_sample,S=GPIO_ISR_sample,Z=sentence_read,P=GPIO_ISR_sample',
-                 '#TRIG,0,FX10E-1,33,25,ah=1', '#TRIG,1,FX10E-2,4,25,ah=1', '#READY',
-                 'T,1,0,1,100', 'T,1,1,1,100', '#TRUNC,0,1,150',
-                 '#HFINAL ppsdrops=0 todtrunc=0 tdrops=0 sdrops=0 host=0 pwmerr=0 trunc=1',
-                 '#SESSION,STOP,pwm']
-        if changes:
-            lines = changes(lines)
-        with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / 'pwm.log'
-            path.write_text('\n'.join(lines) + '\n')
-            return pp.parse_log(path)[0]
-
-    def test_pwm_log_semantics_and_valid_truncation(self):
-        log = self.pwm_log()
-        self.assertEqual(log.time_sources['T'], 'PWM_ISR_sample')
-        self.assertEqual(log.truncated, {0: (1, 150)})
-        self.assertFalse(log.integrity_issues)
-
-    def test_pwm_missing_cut_or_time_metadata_is_invalid(self):
-        for prefix in ('#TRUNC,', '#TIME,', '#READY'):
-            with self.subTest(prefix=prefix):
-                log = self.pwm_log(lambda lines: [x for x in lines if not x.startswith(prefix)])
-                self.assertTrue(log.integrity_issues)
-
-    def test_pwm_error_or_invented_cut_is_invalid(self):
-        for old, new in [('pwmerr=0', 'pwmerr=1'), ('#TRUNC,0,1,150', '#TRUNC,0,3,150')]:
-            log = self.pwm_log(lambda lines: [x.replace(old, new) for x in lines])
-            self.assertTrue(log.integrity_issues)
-
-    def test_pwm_frame_csv_marks_cut_and_preserves_time_source(self):
-        h = 75_000_000
-        lines = ['#SESSION,START,pwm', '#LOG,SensorSync-logger,2,tick_hz=75000000',
-                 '#TIME,T=PWM_ISR_sample,S=GPIO_ISR_sample,Z=sentence_read,P=GPIO_ISR_sample',
-                 '#TRIG,0,FX10E-1,33,25,ah=1', '#TRIG,1,FX10E-2,4,25,ah=1',
-                 '#STROBE,0,FX10E_EXP-1,18,ah=1', '#READY']
-        for i in range(21):
-            body = f'GPZDA,0000{i:02d}.00,09,09,2026,00,00'
-            checksum = 0
-            for c in body:
-                checksum ^= ord(c)
-            lines += [f'P,{i+1},{(i+1)*h}', f'Z,{i+1},{(i+1)*h+h//5},${body}*{checksum:02X}']
-        t = 11 * h
-        lines += [f'T,1,0,1,{t}', f'T,1,1,1,{t}', f'S,1,0,1,{t+75}', f'S,2,0,0,{t+750}',
-                  f'#TRUNC,0,1,{t+1500}',
-                  '#HFINAL ppsdrops=0 todtrunc=0 tdrops=0 sdrops=0 host=0 pwmerr=0 trunc=1',
-                  '#SESSION,STOP,pwm']
-        with tempfile.TemporaryDirectory() as folder:
-            log, out, edges = [Path(folder) / x for x in ('pwm.log', 'frames.csv', 'edges.csv')]
-            log.write_text('\n'.join(lines) + '\n')
-            subprocess.run([sys.executable, str(ROOT / 'postprocess.py'), str(log), '-o', str(out),
-                            '--edges', str(edges), '--tod-scale', 'utc', '--convention', 'preceding'],
-                           check=True, capture_output=True, text=True)
-            with out.open() as f:
-                frame = list(csv.DictReader(f))[0]
-            self.assertTrue(int(frame['flags']) & 0x80)
-            self.assertFalse(int(frame['flags']) & 0x40)
-            self.assertEqual(frame['trigger_time_source'], 'PWM_ISR_sample')
-            self.assertEqual(frame['strobe_time_source'], 'GPIO_ISR_sample')
-            with edges.open() as f:
-                self.assertEqual(list(csv.DictReader(f))[0]['time_source'], 'PWM_ISR_sample')
-
 
 class FakeBoard:
-    def __init__(self, stop_delay=0, start_delay=0, final_health=True, stop_ack=True):
+    def __init__(self, stop_delay=0, start_delay=0, final_health=True, stop_ack=True,
+                 pending_command=b'', fragment_replies=False):
         self.master, self.slave = pty.openpty()
         tty.setraw(self.slave)
         self.port = os.ttyname(self.slave)
@@ -158,20 +96,30 @@ class FakeBoard:
         self.start_delay = start_delay
         self.final_health = final_health
         self.stop_ack = stop_ack
+        self.pending_command = pending_command
+        self.fragment_replies = fragment_replies
+        self.sync_reply = True
+        self.completion_reply = True
+        self.idle_reply = True
+        self.status_reply = '#IDLE,up=123'
+        self.start_error = None
+        self.sync_seen = threading.Event()
         self.commands = []
         self.path = None
-        self.ready_ack = True
-        self.ready_delay = 0
-        self.protocol_version = 2
         self.closed = threading.Event()
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
 
     def send(self, line):
-        os.write(self.master, (line + '\r\n').encode())
+        data = (line + '\r\n').encode()
+        chunk = 3 if self.fragment_replies else len(data)
+        for offset in range(0, len(data), chunk):
+            os.write(self.master, data[offset:offset + chunk])
+            if self.fragment_replies and self.closed.wait(.005):
+                return
 
     def run(self):
-        buf = b''
+        buf = self.pending_command  # firmware cmd[] may already contain an unterminated line
         while not self.closed.is_set():
             try:
                 if not select.select([self.master], [], [], .05)[0]:
@@ -181,6 +129,9 @@ class FakeBoard:
                     line, buf = buf.split(b'\n', 1)
                     cmd = line.decode().strip()
                     self.commands.append(cmd)
+                    if len(line.rstrip(b'\r')) > 255:
+                        self.send('#ERR,command_too_long')
+                        continue
                     if cmd.startswith('START '):
                         payload = cmd[6:]
                         if payload.startswith('freq='):
@@ -188,20 +139,32 @@ class FakeBoard:
                         self.path = payload
                         if self.closed.wait(self.start_delay):
                             return
+                        if self.start_error:
+                            self.send(self.start_error)
                         self.send(f'#SESSION,START,{self.path}')
-                        self.send(f'#LOG,SensorSync-logger,{self.protocol_version},tick_hz=75000000')
-                        self.send('#TIME,T=PWM_ISR_sample,S=GPIO_ISR_sample,Z=sentence_read,P=GPIO_ISR_sample')
-                        if self.closed.wait(self.ready_delay):
-                            return
-                        if self.ready_ack:
-                            self.send('#READY')
+                        self.send('#LOG,SensorSync-logger,1,tick_hz=75000000')
                     elif cmd == 'STOP':
+                        if self.path is None:
+                            if self.idle_reply:
+                                self.send('#IDLE,up=123')
+                            continue
                         if self.closed.wait(self.stop_delay):
                             return
                         if self.final_health:
-                            self.send('#HFINAL ppsdrops=0 todtrunc=0 tdrops=0 sdrops=0 host=0 pwmerr=0 trunc=0')
+                            self.send('#HFINAL ppsdrops=0 todtrunc=0 tdrops=0 sdrops=0 host=0 skip=0 stall=0')
                         if self.stop_ack:
                             self.send(f'#SESSION,STOP,{self.path}')
+                        self.path = None
+                    elif cmd == 's':
+                        if self.idle_reply:
+                            self.send(self.status_reply)
+                    elif cmd:
+                        if cmd.startswith('__SENSORSYNC_SYNC_'):
+                            self.sync_seen.set()
+                            if cmd.endswith('_DONE') and not self.completion_reply:
+                                continue
+                        if not cmd.startswith('__SENSORSYNC_SYNC_') or self.sync_reply:
+                            self.send(f'#ERR,unknown_command,{cmd}')
             except (OSError, ValueError):
                 return
 
@@ -220,21 +183,12 @@ class NativeTests(unittest.TestCase):
         cls.build = tempfile.TemporaryDirectory(prefix='sensorsync_tests_')
         cls.client = Path(cls.build.name) / 'session_client'
         cls.channels = Path(cls.build.name) / 'channels_test'
-        cls.leds = Path(cls.build.name) / 'leds_test'
-        cls.session = Path(cls.build.name) / 'session_test'
         common = ['g++', '-O2', '-Wall', '-Wextra', '-Werror']
         subprocess.run(common + ['-std=c++20', '-pthread', '-DSESSION_CLIENT_DEMO', str(ROOT / 'session_client.cpp'),
                                  '-o', str(cls.client)], check=True, capture_output=True)
         subprocess.run(common + ['-std=c++17', '-I', str(ROOT / 'tests/fakes'), '-I', str(ROOT),
                                  str(ROOT / 'tests/channels_test.cpp'), str(ROOT / 'channels.cpp'),
                                  '-o', str(cls.channels)], check=True, capture_output=True)
-        subprocess.run(common + ['-std=c++17', '-I', str(ROOT / 'tests/fakes'), '-I', str(ROOT),
-                                 str(ROOT / 'tests/leds_test.cpp'), str(ROOT / 'leds.cpp'),
-                                 '-o', str(cls.leds)], check=True, capture_output=True)
-
-        subprocess.run(common + ['-std=c++20', '-Wno-volatile', '-I', str(ROOT / 'tests/fakes'), '-I', str(ROOT),
-                                 str(ROOT / 'tests/session_test.cpp'), str(ROOT / 'channels.cpp'),
-                                 '-o', str(cls.session)], check=True, capture_output=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -261,46 +215,99 @@ class NativeTests(unittest.TestCase):
                               env=self.env, capture_output=True, text=True, timeout=12)
 
     def start(self):
-        result = self.ctl('start', str(self.path), 'FX:25,JAI:5')
+        result = self.ctl('start', str(self.path), '0:25,1:25,2:5,3:7')
         self.assertEqual(result.returncode, 0, result.stderr)
         return Path(result.stdout.strip())
 
-    def test_actual_hardware_pwm_groups(self):
-        subprocess.run([str(self.channels)], check=True, capture_output=True)
+    def replace_board(self, **options):
+        self.board.close()
+        self.board = FakeBoard(**options)
+        self.env['SENSOR_PORT'] = self.board.port
 
-    def test_actual_firmware_session_commands(self):
-        subprocess.run([str(self.session)], check=True, capture_output=True)
+    def run_client(self):
+        return subprocess.run([str(self.client), self.board.port, str(self.path / 'direct.log'), '1', '50'],
+                              capture_output=True, text=True, timeout=8)
 
-    def test_start_waits_for_hardware_ready(self):
-        self.board.ready_delay = .5
-        t0 = time.monotonic()
-        self.start()
-        self.assertGreaterEqual(time.monotonic() - t0, .5)
-        self.assertIn('freq=FX:25,JAI:5', self.board.commands[0])
+    def test_residual_boot_banner_is_recovered_before_start(self):
+        self.replace_board(pending_command=b'# SensorSync-logg', fragment_replies=True)
+        log = self.start()
         self.assertEqual(self.ctl('stop').returncode, 0)
+        diagnostics = Path(str(log) + '.stderr').read_text()
+        self.assertIn('#ERR,unknown_command,# SensorSync-logg', diagnostics)
+        self.assertIn('__SENSORSYNC_SYNC_', diagnostics)
+        data = log.read_text()
+        self.assertTrue(data.startswith('#SESSION,START,'))
+        self.assertNotIn('#ERR', data)
+        self.assertNotIn('__SENSORSYNC_SYNC_', data)
+        self.assertEqual(self.board.commands[0], '# SensorSync-logg')
+        self.assertEqual(self.board.commands[1], 'STOP')
+        self.assertEqual(sum(cmd.startswith('START ') for cmd in self.board.commands), 1)
 
-    def test_missing_ready_rejects_start(self):
-        self.board.ready_ack = False
-        result = self.ctl('start', str(self.path), 'FX:25,JAI:5')
+    def test_overflowed_residual_command_is_recovered(self):
+        self.replace_board(pending_command=b'x' * 256)
+        log = self.start()
+        self.assertEqual(self.ctl('stop').returncode, 0)
+        self.assertIn('#ERR,command_too_long', Path(str(log) + '.stderr').read_text())
+        self.assertNotIn('#ERR', log.read_text())
+
+    def test_stale_idle_cannot_replace_fresh_barrier(self):
+        self.board.sync_reply = False  # STOP and status still return idle
+        result = self.run_client()
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, '')
+        self.assertIn('startup synchronization timed out', result.stderr)
+        self.assertIn('#IDLE,up=', result.stderr)
+        self.assertFalse(any(cmd.startswith('START ') for cmd in self.board.commands))
+        self.assertFalse((self.path / 'direct.log').exists())
 
-    def test_old_firmware_rejected(self):
-        self.board.protocol_version = 1
-        self.assertNotEqual(self.ctl('start', str(self.path), 'FX:25,JAI:5').returncode, 0)
-
-    def test_old_channel_syntax_rejected_before_start(self):
-        self.assertNotEqual(self.ctl('start', str(self.path), '0:25,1:25').returncode, 0)
+    def test_barrier_without_idle_never_starts_capture(self):
+        self.board.idle_reply = False
+        result = self.run_client()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('unexpected reply after startup barrier', result.stderr)
         self.assertFalse(any(cmd.startswith('START ') for cmd in self.board.commands))
 
-    def test_pwm_logging_error_fails_the_run(self):
-        log = self.start()
-        self.board.send('#H pwmerr=1 host=0')
-        self.wait_failed(log)
-        self.assertNotEqual(self.ctl('stop').returncode, 0)
+    def test_idle_without_completion_never_starts_capture(self):
+        self.board.completion_reply = False
+        result = self.run_client()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('startup synchronization timed out', result.stderr)
+        self.assertFalse(any(cmd.startswith('START ') for cmd in self.board.commands))
 
-    def test_actual_led_activity(self):
-        subprocess.run([str(self.leds)], check=True, capture_output=True)
+    def test_non_idle_reply_after_barrier_is_failure(self):
+        self.board.status_reply = '#H up=123 en=1'
+        result = self.run_client()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('unexpected reply after startup barrier', result.stderr)
+        self.assertFalse(any(cmd.startswith('START ') for cmd in self.board.commands))
+
+    def test_real_start_error_is_not_swallowed_as_startup_noise(self):
+        self.board.start_error = '#ERR,bad_freq,0:50'
+        result = self.run_client()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('START rejected: #ERR,bad_freq,0:50', result.stderr)
+        self.assertIn('#ERR,bad_freq,0:50', (self.path / 'direct.log').read_text())
+        self.assertEqual(sum(cmd.startswith('START ') for cmd in self.board.commands), 1)
+
+    def test_oversized_startup_reply_never_starts_capture(self):
+        self.board.status_reply = 'x' * 2049
+        result = self.run_client()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('startup reply exceeds 2048-byte line limit', result.stderr)
+        self.assertFalse(any(cmd.startswith('START ') for cmd in self.board.commands))
+
+    def test_disconnect_during_startup_never_sends_start(self):
+        self.board.sync_reply = False
+        with subprocess.Popen([str(self.client), self.board.port, str(self.path / 'direct.log'), '1', '50'],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as proc:
+            self.assertTrue(self.board.sync_seen.wait(2))
+            self.board.close()
+            _, diagnostics = proc.communicate(timeout=5)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('serial port lost during startup synchronization', diagnostics)
+        self.assertFalse(any(cmd.startswith('START ') for cmd in self.board.commands))
+
+    def test_actual_channels_scheduler(self):
+        subprocess.run([str(self.channels)], check=True, capture_output=True)
 
     def test_start_waits_for_ack_stop_waits_for_final_tail(self):
         self.board.start_delay = .4
@@ -366,9 +373,17 @@ class NativeTests(unittest.TestCase):
         self.assertNotEqual(self.ctl('stop').returncode, 0)
         self.assertEqual(sum(cmd.startswith('START ') for cmd in self.board.commands), 1)
 
+    def test_command_error_during_capture_still_fails_without_restart(self):
+        log = self.start()
+        self.board.send('#ERR,unknown_command,unexpected')
+        self.wait_failed(log)
+        self.assertNotEqual(self.ctl('stop').returncode, 0)
+        self.assertIn('#ERR,unknown_command,unexpected', log.read_text())
+        self.assertEqual(sum(cmd.startswith('START ') for cmd in self.board.commands), 1)
+
     def test_reported_loss_fails_and_new_does_not_hide_failure(self):
         log = self.start()
-        self.board.send('#H ppsdrops=0 todtrunc=0 tdrops=0 sdrops=0 host=1 pwmerr=0 trunc=0')
+        self.board.send('#H ppsdrops=0 todtrunc=0 tdrops=0 sdrops=0 host=1 skip=0 stall=0')
         self.wait_failed(log)
         self.assertNotEqual(self.ctl('new', str(self.path)).returncode, 0)
         self.assertEqual(sum(cmd.startswith('START ') for cmd in self.board.commands), 1)

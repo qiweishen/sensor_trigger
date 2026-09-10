@@ -1,74 +1,81 @@
 #pragma once
+
 #include <charconv>
 #include <cstdint>
 #include <initializer_list>
 #include <string_view>
 
-// Version 2 live client. postprocess.py separately supports historical logs.
-struct SensorSyncProtocol {
-    unsigned starts = 0, truncations = 0;
-    bool header = false, time_mode = false, ready = false;
-    bool stop_received = false, final_health_received = false, failed = false;
-    uint8_t cut_groups = 0;
+// Pre-session synchronization only. An unknown command with a fresh token is
+// a round-trip barrier supported by existing firmware. Old replies (including
+// errors from a residual half-line) belong to diagnostics, not capture data.
+struct SensorSyncStartupProtocol {
+    std::string_view barrier_reply;
+    std::string_view completion_reply;
+    bool barrier_received = false;
+    bool idle_received = false;
+    bool completed = false;
+    bool failed = false;
 
-    static bool integer(std::string_view text, std::uint64_t &value) {
-        const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
-        return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
+    void observe(std::string_view line) {
+        if (line.empty()) return;
+        if (!barrier_received) {
+            if (line == barrier_reply) barrier_received = true;
+            return;
+        }
+        if (line == completion_reply) {
+            if (!idle_received || completed) failed = true;
+            else completed = true;
+            return;
+        }
+        constexpr std::string_view prefix = "#IDLE,up=";
+        if (line.starts_with(prefix)) {
+            const auto value = line.substr(prefix.size());
+            std::uint64_t uptime = 0;
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), uptime);
+            if (parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size()) {
+                idle_received = true;
+                return;
+            }
+        }
+        failed = true; // only idle replies and the final round-trip marker are acceptable
     }
+};
+
+// Host-side integrity checks for the existing SensorSync text protocol.
+// This tracks loss/restarts, not a GPS/UTC solution or PPS-to-ToD association.
+struct SensorSyncProtocol {
+    unsigned starts = 0;
+    bool stop_received = false;
+    bool final_health_received = false;
+    bool failed = false;
+
     void observe(std::string_view line, bool stopping) {
-        if (line.starts_with("#LOG,")) {
-            header = line.starts_with("#LOG,SensorSync-logger,2,");
-            if (!header) failed = true; // never reinterpret old per-camera commands
-        } else if (line.starts_with("#TIME,")) {
-            time_mode = line.find("T=PWM_ISR_sample,") != std::string_view::npos;
-            if (!time_mode) failed = true;
-        } else if (line == "#READY") {
-            if (ready || stopping || starts != 1 || !header || !time_mode) failed = true;
-            ready = true;
-        } else if (line.starts_with("#SESSION,START,")) {
+        if (line.starts_with("#LOG,") && line.ends_with(",cap=0")) failed = true;
+        if (line.starts_with("#SESSION,START,")) {
             if (++starts != 1 || stopping) failed = true;
         } else if (line.starts_with("#SESSION,STOP,")) {
             stop_received = true;
             if (!stopping || !final_health_received) failed = true;
         } else if (line.starts_with("#ERR") || (line.starts_with("#IDLE") && !stopping)) {
             failed = true;
-        } else if (line.starts_with("#TRUNC,")) {
-            line.remove_prefix(7);
-            std::uint64_t values[3] = {};
-            for (unsigned i = 0; i < 3; ++i) {
-                const auto end = line.find(',');
-                if ((i < 2) != (end != std::string_view::npos) || !integer(line.substr(0, end), values[i])) {
-                    failed = true; return;
-                }
-                if (i < 2) line.remove_prefix(end + 1);
-            }
-            if (!stopping || values[0] >= 2 || !(values[1] & 1) || !values[2] ||
-                (cut_groups & (1u << values[0]))) { failed = true; return; }
-            cut_groups |= 1u << values[0];
-            ++truncations;
-            return;
         }
-        const bool final = line.starts_with("#HFINAL ");
-        if (final) {
+        if (line.starts_with("#HFINAL ")) {
             final_health_received = true;
-            if (!stopping || !ready) failed = true;
+            if (!stopping) failed = true;
         }
-        if (line.starts_with("#H ") || final || line.starts_with("#Ht ")) {
-            for (const auto key : {"ppsdrops=", "todtrunc=", "tdrops=", "sdrops=", "host=", "pwmerr=", "trunc="}) {
+        if (line.starts_with("#H ") || line.starts_with("#HFINAL ") || line.starts_with("#Ht ")) {
+            for (const auto key : {"ppsdrops=", "todtrunc=", "tdrops=", "sdrops=", "host=", "skip=", "stall="}) {
                 auto pos = line.find(key);
-                // Match whole health tokens: trunc= must not match todtrunc=.
-                while (pos != std::string_view::npos && pos > 0 && line[pos - 1] != ' ')
-                    pos = line.find(key, pos + 1);
-                if (pos == std::string_view::npos) { if (final) failed = true; continue; }
+                if (pos == std::string_view::npos) {
+                    if (line.starts_with("#HFINAL ")) failed = true;
+                    continue;
+                }
                 pos += std::string_view(key).size();
                 const auto end = line.find(' ', pos);
-                std::uint64_t value = 0;
-                if (!integer(line.substr(pos, end == std::string_view::npos ? end : end - pos), value)) {
-                    failed = true; continue;
-                }
-                if (std::string_view(key) == "trunc=") {
-                    if (final && value != truncations) failed = true;
-                } else if (value != 0) failed = true;
+                const auto value = line.substr(pos, end == std::string_view::npos ? end : end - pos);
+                std::uint64_t count = 0;
+                const auto parsed = std::from_chars(value.data(), value.data() + value.size(), count);
+                if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || count != 0) failed = true;
             }
         }
     }
