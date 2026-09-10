@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Shell lifecycle wrapper around the C++ session client; one protocol implementation.
-# start [outdir] [freqspec] | stop | new [outdir] [freqspec] | status
+# start [outdir] [FX:hz,JAI:hz] | stop | new [outdir] [FX:hz,JAI:hz] | status
 # Env: SENSOR_PORT, SESSION_CLIENT, RECORD_STATE. USB baud is nominally 115200.
 set -u
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -40,11 +40,12 @@ start() {
     if [ -f "$STATE" ]; then echo "existing run: use stop to collect its result first" >&2; return 1; fi
     check_client || return 1
     local outdir="${1:-./logs}" spec="${2:-}" port file pid i
+    if [ -n "$spec" ]; then spec="freq=$spec"; fi
     port=$(find_port) || return 1
     mkdir -p -- "$outdir" || return 1
     outdir=$(cd -- "$outdir" && pwd) || return 1
     file="$outdir/session_$(date +%Y%m%d_%H%M%S_%N).log"
-    setsid "$CLIENT" "$port" "$file" 0 "freq=$spec" "$file.status" </dev/null >"$file.stderr" 2>&1 9>&- &
+    setsid "$CLIENT" "$port" "$file" 0 "$spec" "$file.status" </dev/null >"$file.stderr" 2>&1 9>&- &
     pid=$!
     RUN=("$pid" "$file" "$port")
     if ! printf '%s\n' "${RUN[@]}" > "$STATE"; then
@@ -110,5 +111,5 @@ case "${1:-}" in
     stop) stop ;;
     new) shift; if [ -f "$STATE" ]; then stop || exit 1; fi; start "$@" ;;
     status) status ;;
-    *) echo "usage: $0 {start [outdir] [freqspec] | stop | new [outdir] [freqspec] | status}" >&2; exit 2 ;;
+    *) echo "usage: $0 {start [outdir] [FX:hz,JAI:hz] | stop | new [outdir] [FX:hz,JAI:hz] | status}" >&2; exit 2 ;;
 esac

@@ -1,50 +1,57 @@
+#include <stdint.h>
+// Teensy supplies its own startup; only use the CMSIS CPU intrinsics here.
+#define __PROGRAM_START
+#include "cmsis_gcc.h"
+#undef __PROGRAM_START
 #include "channels.h"
-
-#include <cmath>
-#include <cstring>
-#include <iterator>
-
 #include "timebase.h"
+#include <cmath>
 
 namespace channels {
+namespace {
+constexpr uint16_t kModules = (1u << 0) | (1u << 3);
+constexpr uint16_t kOutputs = FLEXPWM_OUTEN_PWMA_EN(kModules) | FLEXPWM_OUTEN_PWMB_EN(kModules);
+constexpr uint16_t kRise = FLEXPWM_SMSTS_CMPF(1u << 2);
+constexpr uint16_t kFall = FLEXPWM_SMSTS_CMPF(1u << 3);
+constexpr uint16_t kEdges = kRise | kFall;
+constexpr uint8_t kSubmodule[] = {0, 3};
+static_assert(TRIG_MAX == 4 && STROBE_MAX == 4, "four wired cameras required");
+static_assert(TRIG_CFG[0].pin == 33 && TRIG_CFG[1].pin == 4 &&
+              TRIG_CFG[2].pin == 37 && TRIG_CFG[3].pin == 36, "Teensy 4.1 FlexPWM2 pin mapping");
+static_assert(TRIG_CFG[0].active_high && TRIG_CFG[1].active_high &&
+              TRIG_CFG[2].active_high && TRIG_CFG[3].active_high, "PCB uses active-high triggers");
+static_assert([] {
+    if (PPS_PIN >= CORE_NUM_DIGITAL || PPS_PIN == 0 || PPS_PIN == 1) return false;
+    for (const auto &c : TRIG_CFG) if (c.pin == PPS_PIN) return false;
+    for (uint8_t i = 0; i < STROBE_MAX; ++i) {
+        const auto pin = STROBE_CFG[i].pin;
+        if (pin >= CORE_NUM_DIGITAL || pin == 0 || pin == 1 || pin == PPS_PIN) return false;
+        for (const auto &c : TRIG_CFG) if (c.pin == pin) return false;
+        for (uint8_t j = 0; j < i; ++j) if (STROBE_CFG[j].pin == pin) return false;
+    }
+    return true;
+}(), "PPS and strobes must not overlap triggers, each other, or Serial1");
+static_assert(PWM_IRQ_PRIORITY > TB_IRQ_PRIORITY && PWM_IRQ_PRIORITY < STROBE_IRQ_PRIORITY,
+              "PWM logging must not preempt GPT1 and must outrank GPIO");
+struct IrqGuard {
+    uint32_t saved = __get_PRIMASK();
+    IrqGuard() { __disable_irq(); }
+    ~IrqGuard() { __set_PRIMASK(saved); }
+};
+struct State {
+    uint64_t last_sample = 0, period_gpt = 0, stop_tick = 0;
+    uint32_t errors = 0, cut_seq = 0;
+    bool high = false;
+};
+trigger::Rates g_rates = TRIGGER_DEFAULT_RATES;
+trigger::Timing g_timing[2];
+State g_state[2];
+volatile bool g_enabled = false, g_fault = false;
+bool g_ready = false;
+} // namespace
 
-	// ---------------------------------------------------------------------------
-	// One compare wakes the scheduler for the earliest edge of any wired channel.
-	static_assert(TRIG_MAX > 0 && TRIG_MAX <= 4, "scheduler supports 1..4 trigger channels");
-	static_assert([] {
-		for (uint8_t i = 0; i < TRIG_MAX; ++i) {
-			if (!TRIG_CFG[i].name || TRIG_CFG[i].pin >= CORE_NUM_DIGITAL ||
-			    TRIG_CFG[i].pin == 0 || TRIG_CFG[i].pin == 1 || TRIG_CFG[i].pin == PPS_PIN) return false;
-			for (uint8_t j = 0; j < i; ++j)
-				if (TRIG_CFG[i].pin == TRIG_CFG[j].pin) return false;
-			for (uint8_t j = 0; j < STROBE_MAX; ++j)
-				if (TRIG_CFG[i].pin == STROBE_CFG[j].pin) return false;
-		}
-		return true;
-	}(), "trigger pins must be unique and must not overlap Serial1, PPS or strobes");
-
-
-	// ---------------------------------------------------------------------------
-	// Trigger channel state
-	struct TrigState {
-		uint64_t period_ticks;
-		uint64_t width_ticks;
-		uint64_t phase_ticks;
-		uint64_t rise_tick;		 // absolute tick of the current/next rising edge
-		uint64_t fall_tick;       // sampled rise + pulse width
-		volatile uint8_t stage;	 // 0 = rise scheduled, 1 = fall scheduled
-		bool cfg_ok;			 // config validated in begin() (else channel disabled)
-	};
-	static TrigState g_trig[TRIG_MAX];
-	static volatile bool g_enabled = false;
-	static uint64_t g_margin_ticks = 0;
-	static double g_freq_eff[TRIG_MAX] = { 0 };	 // effective rate (0 = disabled)
-
-
-	// ---------------------------------------------------------------------------
-	// Event rings.
-	// Each has a SINGLE producer context: g_trigq from the GPT1 ISR, g_strobeq from the GPIO ISR - so both are plain SPSC (no locks).
-	// Per-channel sequence numbers advance even on a drop, so a gap in the log is detectable.
+// PWM IRQs have equal priority and cannot nest; STOP invokes the same handler
+// with IRQs masked. Queue writes are therefore serialized. GPIO owns Strobe.
 	struct Evt {
 		uint8_t ch;
 		uint8_t level;
@@ -55,8 +62,6 @@ namespace channels {
 	static volatile Evt g_trigq[EVT_RING_SIZE];
 	static volatile uint16_t g_trigq_head = 0, g_trigq_tail = 0;
 	static volatile uint32_t g_trig_seq[TRIG_MAX] = { 0 };
-	static volatile uint32_t g_skipped[TRIG_MAX] = { 0 };
-	static volatile uint32_t g_stalled[TRIG_MAX] = { 0 };  // scheduler overload; outputs parked until next START
 	static volatile uint32_t g_trig_drops = 0;
 
 	static volatile Evt g_strobeq[EVT_RING_SIZE];
@@ -77,6 +82,7 @@ namespace channels {
 		g_trigq[h].level = level;
 		g_trigq[h].tick = tick;
 		g_trigq[h].seq = s;
+		__DMB();
 		g_trigq_head = nh;
 	}
 
@@ -96,6 +102,7 @@ namespace channels {
 		g_strobeq[h].level = level;
 		g_strobeq[h].tick = tick;
 		g_strobeq[h].seq = s;
+		__DMB();
 		g_strobeq_head = nh;
 	}
 
@@ -104,11 +111,13 @@ namespace channels {
 		if (g_trigq_tail == g_trigq_head) {
 			return false;
 		}
+		__DMB();
 		const uint16_t t = g_trigq_tail;
 		ch = g_trigq[t].ch;
 		level = g_trigq[t].level;
 		tick = g_trigq[t].tick;
 		seq = g_trigq[t].seq;
+		__DMB();
 		g_trigq_tail = static_cast<uint16_t>((t + 1) % EVT_RING_SIZE);
 		return true;
 	}
@@ -118,293 +127,224 @@ namespace channels {
 		if (g_strobeq_tail == g_strobeq_head) {
 			return false;
 		}
+		__DMB();
 		const uint16_t t = g_strobeq_tail;
 		ch = g_strobeq[t].ch;
 		level = g_strobeq[t].level;
 		tick = g_strobeq[t].tick;
 		seq = g_strobeq[t].seq;
+		__DMB();
 		g_strobeq_tail = static_cast<uint16_t>((t + 1) % EVT_RING_SIZE);
 		return true;
 	}
 
 
-	// ---------------------------------------------------------------------------
-	// Trigger generation
-	static inline uint8_t activeLevel(uint8_t i) {
-		return TRIG_CFG[i].active_high ? HIGH : LOW;
-	}
-	static inline uint8_t idleLevel(uint8_t i) {
-		return TRIG_CFG[i].active_high ? LOW : HIGH;
-	}
-	static void setIdle(uint8_t i) {
-		digitalWriteFast(TRIG_CFG[i].pin, idleLevel(i));
-	}
+namespace {
+void freezeCounters() {
+    for (uint8_t sm : kSubmodule) IMXRT_FLEXPWM2.SM[sm].INTEN = 0;
+    // RUN=0 resets counters, but holds PWM outputs (RM 55.8.48).
+    IMXRT_FLEXPWM2.MCTRL &= ~FLEXPWM_MCTRL_RUN(kModules);
+    __DSB();
+}
+void parkPins() {
+    IMXRT_FLEXPWM2.MASK = IMXRT_FLEXPWM2.MASK | kOutputs | FLEXPWM_MASK_UPDATE_MASK(kModules);
+    // MASK updates on a clock edge. GPIO takeover guarantees LOW even with the
+    // counters stopped or a missing AUX clock. Preload LOW before changing mux.
+    for (const auto &c : TRIG_CFG) {
+        digitalWriteFast(c.pin, LOW);
+        pinMode(c.pin, OUTPUT);
+    }
+    __DSB();
+}
+void fail(uint8_t group) {
+    ++g_state[group].errors;
+    g_fault = true;
+    freezeCounters();
+    parkPins();
+    g_enabled = false;
+}
+void pwmEvent(uint8_t group) {
+    const uint64_t tick = timebase::now();
+    auto &sm = IMXRT_FLEXPWM2.SM[kSubmodule[group]];
+    const uint16_t status = sm.STS;
+    const uint16_t edges = status & kEdges;
+    sm.STS = status; // W1C, never clear a later flag by read/modify/write
+    if (!g_enabled || g_rates.hz[group] == 0 || (!edges && !(status & FLEXPWM_SMSTS_REF))) return;
+    State &s = g_state[group];
+    // Sticky flags cannot reconstruct merged events. Never fabricate their times.
+    if ((status & FLEXPWM_SMSTS_REF) || edges != (s.high ? kFall : kRise) ||
+        tick - s.last_sample >= s.period_gpt) {
+        fail(group);
+        return;
+    }
+    s.high = edges == kRise;
+    s.last_sample = tick;
+    for (uint8_t ch = 2 * group; ch < 2 * group + 2; ++ch)
+        pushTrig(ch, s.high ? HIGH : LOW, tick);
+    if (g_trig_drops) fail(group);
+}
+void pwm0Isr() { pwmEvent(0); __DSB(); }
+void pwm3Isr() { pwmEvent(1); __DSB(); }
 
+template<uint8_t ch> void strobeIsr() {
+    const uint64_t t = timebase::now();
+    pushStrobe(ch, static_cast<uint8_t>(digitalReadFast(STROBE_CFG[ch].pin)), t);
+}
+void program(uint8_t group) {
+    const auto &t = g_timing[group];
+    auto &sm = IMXRT_FLEXPWM2.SM[kSubmodule[group]];
+    // Local sync/reload, independent A/B, no complementary polarity or deadtime.
+    sm.CTRL2 = FLEXPWM_SMCTRL2_INDEP | FLEXPWM_SMCTRL2_WAITEN | FLEXPWM_SMCTRL2_DBGEN |
+               FLEXPWM_SMCTRL2_FRCEN | FLEXPWM_SMCTRL2_CLK_SEL(group ? 2 : 0);
+    sm.CTRL = FLEXPWM_SMCTRL_FULL | FLEXPWM_SMCTRL_LDMOD | FLEXPWM_SMCTRL_PRSC(t.prescale);
+    sm.INIT = 0;
+    sm.VAL0 = 0;
+    sm.VAL1 = t.period - 1;
+    sm.VAL2 = sm.VAL4 = t.width; // first pulse starts after a defined LOW interval
+    sm.VAL3 = sm.VAL5 = 2 * t.width;
+    sm.FRCTRL = 0;
+    sm.FRACVAL1 = sm.FRACVAL2 = sm.FRACVAL3 = sm.FRACVAL4 = sm.FRACVAL5 = 0;
+    sm.OCTRL = 0;
+    sm.DTCNT0 = sm.DTCNT1 = 0;
+    sm.DISMAP0 = sm.DISMAP1 = 0; // no wired fault inputs in this board
+    sm.DMAEN = sm.TCTRL = 0;
+    sm.CAPTCTRLA = sm.CAPTCTRLB = sm.CAPTCTRLX = 0;
+    sm.INTEN = 0;
+}
+} // namespace
 
-	// Catch up without compressing missed trigger periods into a burst.
-	static void advanceRise(const uint8_t ch, const uint64_t deadline) {
-		TrigState &s = g_trig[ch];
-		if (s.rise_tick <= deadline) {
-			const uint64_t n = (deadline - s.rise_tick) / s.period_ticks + 1;
-			s.rise_tick += n * s.period_ticks;
-			g_skipped[ch] += static_cast<uint32_t>(n);
-		}
-	}
+bool validateRates(const trigger::Rates &rates) {
+    // The approved clock tree and GPT conversion assume this project clock.
+    if (F_BUS_ACTUAL != 150000000u) return false;
+    trigger::Timing next;
+    for (uint8_t g = 0; g < 2; ++g)
+        if (!trigger::calculate(static_cast<trigger::Group>(g), rates.hz[g],
+                                GROUP_PULSE_US[g], F_BUS_ACTUAL, next)) return false;
+    return true;
+}
+bool applyRates(const trigger::Rates &rates) {
+    if (g_enabled || !validateRates(rates)) return false;
+    trigger::Timing next[2];
+    for (uint8_t g = 0; g < 2; ++g)
+        trigger::calculate(static_cast<trigger::Group>(g), rates.hz[g], GROUP_PULSE_US[g], F_BUS_ACTUAL, next[g]);
+    g_rates = rates;
+    for (uint8_t g = 0; g < 2; ++g) g_timing[g] = next[g];
+    g_ready = true;
+    return true;
+}
+trigger::Rates requestedRates() { return g_rates; }
+const trigger::Timing &timing(uint8_t group) { return g_timing[group < 2 ? group : 0]; }
+double freqHz(uint8_t ch) { return ch < TRIG_MAX ? g_timing[ch / 2].actual_hz : 0; }
 
-	static uint64_t nextEdge(const TrigState &s) {
-		return s.stage ? s.fall_tick : s.rise_tick;
-	}
+bool setEnabled(bool on) {
+    IrqGuard lock;
+    if (!on) {
+        freezeCounters();
+        // No further PWM events can arrive. Drain final pending flags once; these
+        // remain handler samples, including when the handler is called by STOP.
+        if (g_enabled) for (uint8_t g = 0; g < 2; ++g) pwmEvent(g);
+        parkPins();
+        const uint64_t tick = timebase::now();
+        if (!g_fault) for (uint8_t g = 0; g < 2; ++g) {
+            if (g_state[g].high) {
+                g_state[g].cut_seq = g_trig_seq[2 * g];
+                g_state[g].stop_tick = tick;
+            }
+        }
+        g_enabled = false;
+        return true;
+    }
+    if (g_enabled) return true;
+    if (!g_ready || g_fault || !validateRates(g_rates)) return false;
+    freezeCounters();
+    parkPins();
+    IMXRT_FLEXPWM2.MCTRL |= FLEXPWM_MCTRL_CLDOK(kModules);
+    for (uint8_t g = 0; g < 2; ++g) program(g);
+    // Preserve other submodules' output selectors; select generated PWM for ours.
+    IMXRT_FLEXPWM2.DTSRCSEL &= ~uint16_t(0xF00F);
+    IMXRT_FLEXPWM2.MCTRL |= FLEXPWM_MCTRL_LDOK(kModules);
+    for (uint8_t g = 0; g < 2; ++g) {
+        auto &sm = IMXRT_FLEXPWM2.SM[kSubmodule[g]];
+        sm.CTRL2 |= FLEXPWM_SMCTRL2_FORCE; // initialize CNT and PWM latches LOW
+        sm.STS = 0xFFFF;
+        sm.INTEN = g_rates.hz[g] > 0 ? FLEXPWM_SMINTEN_CMPIE((1u << 2) | (1u << 3)) |
+                                         FLEXPWM_SMINTEN_REIE : 0;
+        g_state[g].high = false;
+        g_state[g].period_gpt = static_cast<uint64_t>(std::llround(
+            g_timing[g].period * timebase::nominalHz() / g_timing[g].clock_hz));
+    }
+    NVIC_CLEAR_PENDING(IRQ_FLEXPWM2_0);
+    NVIC_CLEAR_PENDING(IRQ_FLEXPWM2_3);
+    // Exact muxes for Teensy 4.1. Disabled pairs stay GPIO LOW even when their
+    // PWM clock is stopped; never expose a held PWM latch on a disabled pin.
+    if (g_rates.hz[0] > 0) *portConfigRegister(33) = *portConfigRegister(4) = 1;
+    if (g_rates.hz[1] > 0) *portConfigRegister(37) = *portConfigRegister(36) = 6;
+    IMXRT_FLEXPWM2.OUTEN |= kOutputs;
+    uint16_t active = 0;
+    for (uint8_t g = 0; g < 2; ++g) if (g_rates.hz[g] > 0) active |= 1u << kSubmodule[g];
+    const uint16_t mask = FLEXPWM_MASK_MASKA(active) | FLEXPWM_MASK_MASKB(active);
+    IMXRT_FLEXPWM2.MASK = (IMXRT_FLEXPWM2.MASK & ~mask) | FLEXPWM_MASK_UPDATE_MASK(kModules);
+    const uint64_t start = timebase::now();
+    for (auto &s : g_state) s.last_sample = start;
+    g_enabled = true;
+    // JAI alone still needs SM0 RUN to produce AUX_CLK. Both off may still log inputs.
+    const uint16_t run = active ? (active | 1u) : 0;
+    IMXRT_FLEXPWM2.MCTRL |= FLEXPWM_MCTRL_RUN(run);
+    __DSB();
+    return true;
+}
 
-	static void serviceEdge(const uint8_t ch, const uint64_t now) {
-		TrigState &s = g_trig[ch];
-		if (!s.stage) {
-			if (now >= s.rise_tick + s.width_ticks) {
-				// The entire intended pulse window passed. Skip it rather than emit a runt.
-				advanceRise(ch, now + g_margin_ticks);
-				return;
-			}
-			digitalWriteFast(TRIG_CFG[ch].pin, activeLevel(ch));
-			const uint64_t tick = timebase::now();
-			pushTrig(ch, activeLevel(ch), tick);
-			s.fall_tick = tick + s.width_ticks;
-			s.stage = 1;
-		} else {
-			setIdle(ch);
-			pushTrig(ch, idleLevel(ch), timebase::now());
-			s.stage = 0;
-			s.rise_tick += s.period_ticks;
-			advanceRise(ch, timebase::now() + g_margin_ticks);
-		}
-	}
-
-	static void scheduleNext() {
-		// Bounded even for overload or a compare passed during the register write.
-		for (unsigned attempt = 0; attempt < 2 * TRIG_MAX + 8; ++attempt) {
-			uint8_t ch = TRIG_MAX;
-			uint64_t tick = UINT64_MAX;
-			for (uint8_t i = 0; i < TRIG_MAX; ++i) {
-				if (g_trig[i].cfg_ok && nextEdge(g_trig[i]) < tick) {
-					ch = i;
-					tick = nextEdge(g_trig[i]);
-				}
-			}
-			if (ch == TRIG_MAX) {
-				GPT1_IR &= ~SS_GPT_IR_OF1IE;
-				return;
-			}
-			const uint64_t now = timebase::now();
-			if (tick <= now) {
-				serviceEdge(ch, now);
-				continue;
-			}
-			GPT1_OCR1 = static_cast<uint32_t>(tick);
-			GPT1_SR = SS_GPT_SR_OF1;
-			GPT1_IR |= SS_GPT_IR_OF1IE;
-			// GPT compares equality. Never leave a passed compare armed for a full wrap.
-			if (static_cast<int32_t>(GPT1_CNT - static_cast<uint32_t>(tick)) < 0) return;
-		}
-		// Overload: park every output and report the failure; a new START can recover.
-		GPT1_IR &= ~SS_GPT_IR_OF1IE;
-		for (uint8_t i = 0; i < TRIG_MAX; ++i) {
-			if (!g_trig[i].cfg_ok) continue;
-			if (g_trig[i].stage) {
-				setIdle(i);
-				pushTrig(i, idleLevel(i), timebase::now());
-			}
-			g_trig[i].stage = 0;
-			++g_stalled[i];
-		}
-	}
-
-	void gptIsr(const uint32_t sr) {
-		if (g_enabled && (sr & SS_GPT_SR_OF1) && (GPT1_IR & SS_GPT_IR_OF1IE)) scheduleNext();
-	}
-
-
-	// ---------------------------------------------------------------------------
-	// Strobe / Exposure-Active capture (both edges, raw)
-	// Thin ISR: read the time before the level, or the GPIO read folds into the measurement.
-	template<uint8_t N>
-	static void strobeIsr() {
-		constexpr uint8_t IDX = (N < STROBE_MAX) ? N : 0;
-		const uint64_t t = timebase::now();
-		pushStrobe(IDX, static_cast<uint8_t>(digitalReadFast(STROBE_CFG[IDX].pin)), t);
-	}
-
-	typedef void (*IsrFn)();
-	static const IsrFn kStrobeIsr[] = {
-		strobeIsr<0>, strobeIsr<1>, strobeIsr<2>, strobeIsr<3>, strobeIsr<4>, strobeIsr<5>, strobeIsr<6>, strobeIsr<7>,
-	};
-	static_assert(STROBE_MAX <= static_cast<int>(std::size(kStrobeIsr)), "STROBE_MAX exceeds the kStrobeIsr table");
-
-
-	// ---------------------------------------------------------------------------
-	void setEnabled(const bool on) {
-		if (on == g_enabled) {
-			return;
-		}
-		__disable_irq();
-		if (on) {
-			GPT1_SR = SS_GPT_SR_OF1;
-			g_enabled = true;
-			const uint64_t start = timebase::now() + g_margin_ticks * 4;
-			for (uint8_t i = 0; i < TRIG_MAX; ++i) {
-				g_trig[i].stage = 0;
-				g_trig[i].rise_tick = start + g_trig[i].phase_ticks;
-			}
-			scheduleNext();
-		} else {
-			g_enabled = false;
-			GPT1_IR &= ~SS_GPT_IR_OF1IE;
-			for (uint8_t i = 0; i < TRIG_MAX; ++i) setIdle(i);
-		}
-		__enable_irq();
-	}
-
-
-	// Validate + program period/width/phase for channel i at `hz`. Warns loudly and
-	// returns false on reject, leaving the old timing intact. hz == 0 = silent off.
-	// Rules: freq >= 1 Hz (whole-tick period), period >= 4*margin (scheduler margin),
-	// phase >= 0 (stagger, folded modulo the period).
-	static bool configFreq(const uint8_t i, const double hz) {
-		const double nom = timebase::nominalHz();
-		const TriggerCfg &c = TRIG_CFG[i];
-		if (hz == 0.0) {
-			return false;  // configured off, not an error
-		}
-		if (!std::isfinite(hz) || hz < 1.0) {
-			Serial.printf("# !! WARNING: trig[%u] %s freq=%.4fHz must be finite and >= 1 Hz; channel DISABLED\n", i, c.name, hz);
-			return false;
-		}
-		const uint64_t min_period = g_margin_ticks * 4;
-		const auto period = static_cast<uint64_t>(llround(nom / hz));
-		if (period < min_period) {
-			Serial.printf("# !! WARNING: trig[%u] %s freq=%.4fHz too fast (period < %llu ticks); channel DISABLED\n", i, c.name, hz,
-						  static_cast<unsigned long long>(min_period));
-			return false;
-		}
-		if (!std::isfinite(c.phase_s) || c.phase_s < 0.0) {
-			Serial.printf("# !! WARNING: trig[%u] %s invalid phase_s=%.4f; channel DISABLED\n", i, c.name, c.phase_s);
-			return false;
-		}
-		g_trig[i].period_ticks = period;
-		g_trig[i].width_ticks = static_cast<uint64_t>(llround(c.pulse_us * 1e-6 * nom));
-		if (g_trig[i].width_ticks < g_margin_ticks) {
-			// must outlast the ISR path to the fall
-			Serial.printf("# !! WARNING: trig[%u] %s pulse widened %lluus -> %.1fus (ISR margin)\n", i, c.name,
-						  (unsigned long long) c.pulse_us, g_margin_ticks * 1e6 / nom);
-			g_trig[i].width_ticks = g_margin_ticks;
-		}
-		if (g_trig[i].width_ticks >= period) {
-			// keep the fall before the next rise
-			Serial.printf("# !! WARNING: trig[%u] %s pulse %lluus >= period; clamped to period/2\n", i, c.name,
-						  (unsigned long long) c.pulse_us);
-			g_trig[i].width_ticks = period / 2;
-		}
-		// Fold keeps targets within the signed 32-bit compare horizon (rates >= 1 Hz).
-		g_trig[i].phase_ticks = static_cast<uint64_t>(llround(std::fmod(c.phase_s, period / nom) * nom)) % period;
-		return true;
-	}
-
-
-	// Runtime rate change (host START option). Only while disabled; the caller
-	// re-enables and the new period takes effect from the session start.
-	bool setFreqHz(const uint8_t ch, const double hz) {
-		if (ch >= TRIG_MAX || g_enabled) {
-			return false;
-		}
-		if (!std::isfinite(hz) || hz < 0.0) return false;
-		if (hz == 0.0) {  // deliberate off
-			g_trig[ch].cfg_ok = false;
-			g_freq_eff[ch] = 0.0;
-			return true;
-		}
-		if (!configFreq(ch, hz)) {
-			return false;  // rejected: old rate kept
-		}
-		g_trig[ch].cfg_ok = true;
-		g_freq_eff[ch] = timebase::nominalHz() / g_trig[ch].period_ticks;
-		return true;
-	}
-
-	double freqHz(const uint8_t ch) {
-		return ch < TRIG_MAX ? g_freq_eff[ch] : 0.0;
-	}
-
-
-	void begin() {
-		const double nom = timebase::nominalHz();
-		g_margin_ticks = static_cast<uint64_t>(nom * 5e-6);	 // 5 us
-		if (g_margin_ticks == 0) g_margin_ticks = 1;
-
-		for (uint8_t i = 0; i < TRIG_MAX; i++) {
-			memset(&g_trig[i], 0, sizeof(TrigState));
-			g_trig_seq[i] = 0;
-			g_skipped[i] = 0;
-			g_stalled[i] = 0;
-			g_trig[i].cfg_ok = configFreq(i, TRIG_CFG[i].freq_hz);
-			g_freq_eff[i] = g_trig[i].cfg_ok ? nom / g_trig[i].period_ticks : 0.0;
-			pinMode(TRIG_CFG[i].pin, OUTPUT);
-			setIdle(i);
-		}
-
-		for (uint8_t i = 0; i < STROBE_MAX; i++) {
-			g_strobe_seq[i] = 0;
-			// Bias bare-board inputs. The PCB buffer overrides this pull;
-			// its external camera-side pull-up makes a disconnected camera read HIGH.
-			pinMode(STROBE_CFG[i].pin, STROBE_CFG[i].active_high ? INPUT_PULLDOWN : INPUT_PULLUP);
-		}
-		for (uint8_t i = 0; i < STROBE_MAX; i++) {
-			attachInterrupt(digitalPinToInterrupt(STROBE_CFG[i].pin), kStrobeIsr[i], CHANGE);
-		}
-		// PPS (software mode) shares this vector; keep >= 32 from GPT1 (see config.h).
-		NVIC_SET_PRIORITY(IRQ_GPIO6789, STROBE_IRQ_PRIORITY);
-
-		// Boot idle: no triggers, no strobe capture. A START command begins a session.
-	}
-
-
-	// Zero every per-channel counter and empty the event rings, so the next session counts from 0.
-	// Call only while disabled (no ISR is pushing).
-	void resetCounts() {
-		__disable_irq();
-		for (uint8_t i = 0; i < TRIG_MAX; i++) {
-			g_trig_seq[i] = 0;
-			g_skipped[i] = 0;
-			g_stalled[i] = 0;
-		}
-		for (uint8_t i = 0; i < STROBE_MAX; i++) {
-			g_strobe_seq[i] = 0;
-		}
-		g_trig_drops = 0;
-		g_strobe_drops = 0;
-		g_trigq_head = g_trigq_tail = 0;
-		g_strobeq_head = g_strobeq_tail = 0;
-		__enable_irq();
-	}
-
-
-	// ---------------------------------------------------------------------------
-	bool enabled() {
-		return g_enabled;
-	}
-	uint32_t trigCount(const uint8_t ch) {
-		return ch < TRIG_MAX ? g_trig_seq[ch] : 0;
-	}
-	uint32_t strobeCount(const uint8_t ch) {
-		return ch < STROBE_MAX ? g_strobe_seq[ch] : 0;
-	}
-	uint32_t skippedCount(const uint8_t ch) {
-		return ch < TRIG_MAX ? g_skipped[ch] : 0;
-	}
-	uint32_t stalledCount(const uint8_t ch) {
-		return ch < TRIG_MAX ? g_stalled[ch] : 0;
-	}
-	uint32_t trigDrops() {
-		return g_trig_drops;
-	}
-	uint32_t strobeDrops() {
-		return g_strobe_drops;
-	}
-
-}  // namespace channels
+void begin() {
+    CCM_CCGR4 |= CCM_CCGR4_PWM2(CCM_CCGR_ON);
+    freezeCounters();
+    parkPins();
+    applyRates(TRIGGER_DEFAULT_RATES);
+    attachInterruptVector(IRQ_FLEXPWM2_0, pwm0Isr);
+    attachInterruptVector(IRQ_FLEXPWM2_3, pwm3Isr);
+    NVIC_SET_PRIORITY(IRQ_FLEXPWM2_0, PWM_IRQ_PRIORITY);
+    NVIC_SET_PRIORITY(IRQ_FLEXPWM2_3, PWM_IRQ_PRIORITY);
+    NVIC_ENABLE_IRQ(IRQ_FLEXPWM2_0);
+    NVIC_ENABLE_IRQ(IRQ_FLEXPWM2_3);
+    void (*const callbacks[])() = {strobeIsr<0>, strobeIsr<1>, strobeIsr<2>, strobeIsr<3>};
+    for (uint8_t ch = 0; ch < STROBE_MAX; ++ch) {
+        pinMode(STROBE_CFG[ch].pin, STROBE_CFG[ch].active_high ? INPUT_PULLDOWN : INPUT_PULLUP);
+        attachInterrupt(digitalPinToInterrupt(STROBE_CFG[ch].pin), callbacks[ch], CHANGE);
+    }
+    NVIC_SET_PRIORITY(IRQ_GPIO6789, STROBE_IRQ_PRIORITY);
+}
+void pollHealth() {
+    IrqGuard lock;
+    if (!g_enabled) return;
+    const uint64_t tick = timebase::now();
+    for (uint8_t g = 0; g < 2; ++g) {
+        if (g_rates.hz[g] > 0 && tick - g_state[g].last_sample >
+            g_state[g].period_gpt + static_cast<uint64_t>(timebase::nominalHz() / 100)) {
+            fail(g);
+            return;
+        }
+    }
+}
+void resetCounts() {
+    IrqGuard lock;
+    if (g_enabled) return;
+    for (auto &s : g_state) s = {};
+    for (auto &s : g_trig_seq) s = 0;
+    for (auto &s : g_strobe_seq) s = 0;
+    g_trig_drops = g_strobe_drops = 0;
+    g_trigq_head = g_trigq_tail = g_strobeq_head = g_strobeq_tail = 0;
+    g_fault = false;
+}
+bool enabled() { return g_enabled; }
+bool faulted() { return g_fault; }
+uint32_t trigCount(uint8_t ch) { return ch < TRIG_MAX ? g_trig_seq[ch] : 0; }
+uint32_t strobeCount(uint8_t ch) { return ch < STROBE_MAX ? g_strobe_seq[ch] : 0; }
+uint32_t pwmErrors(uint8_t group) { IrqGuard lock; return group < 2 ? g_state[group].errors : 0; }
+uint32_t trigDrops() { return g_trig_drops; }
+uint32_t strobeDrops() { return g_strobe_drops; }
+bool truncation(uint8_t group, uint32_t &rise_seq, uint64_t &stop_tick) {
+    if (group >= 2 || !g_state[group].cut_seq) return false;
+    rise_seq = g_state[group].cut_seq;
+    stop_tick = g_state[group].stop_tick;
+    return true;
+}
+} // namespace channels

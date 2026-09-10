@@ -6,7 +6,7 @@
 // =============================================================================
 //  timebase - GPT1 free-running counter, software-extended to 64 bit.
 //
-//  The firmware's only time ruler; every capture and compare value is in its
+//  The firmware's only time ruler; every logged event value is in its
 //  ticks. GPT1 is 32 bit and wraps every 2^32 ticks (57 s at 75 MHz); the ROV
 //  interrupt extends it to 64 bit.
 // =============================================================================
@@ -22,10 +22,8 @@ namespace timebase {
 #define SS_GPT_CR_CLKSRC(n) (((n) & 7u) << 6)
 #define SS_GPT_CR_FRR (1u << 9)
 #define SS_GPT_CR_SWR (1u << 15)
-#define SS_GPT_IR_OF1IE (1u << 0)
 #define SS_GPT_IR_ROVIE (1u << 5)
 
-#define SS_GPT_SR_OF1 (1u << 0)
 #define SS_GPT_SR_ROV (1u << 5)
 
 	void begin();
@@ -37,8 +35,5 @@ namespace timebase {
 	// never call from an ISR that preempts GPT1 (rollover window race)
 	uint64_t now();
 
-	// Trigger scheduler shares GPT1 with the rollover counter.
-	typedef void (*IsrHook)(uint32_t status);
-	void setIsrHook(IsrHook h);
 
 }  // namespace timebase

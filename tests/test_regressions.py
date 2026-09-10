@@ -85,6 +85,69 @@ class PostprocessTests(unittest.TestCase):
             self.assertEqual(frames[1]['dur_us'], '')
             self.assertTrue(int(frames[1]['flags']) & 1)
 
+    def pwm_log(self, changes=None):
+        lines = ['#SESSION,START,pwm', '#LOG,SensorSync-logger,2,tick_hz=75000000',
+                 '#TIME,T=PWM_ISR_sample,S=GPIO_ISR_sample,Z=sentence_read,P=GPIO_ISR_sample',
+                 '#TRIG,0,FX10E-1,33,25,ah=1', '#TRIG,1,FX10E-2,4,25,ah=1', '#READY',
+                 'T,1,0,1,100', 'T,1,1,1,100', '#TRUNC,0,1,150',
+                 '#HFINAL ppsdrops=0 todtrunc=0 tdrops=0 sdrops=0 host=0 pwmerr=0 trunc=1',
+                 '#SESSION,STOP,pwm']
+        if changes:
+            lines = changes(lines)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'pwm.log'
+            path.write_text('\n'.join(lines) + '\n')
+            return pp.parse_log(path)[0]
+
+    def test_pwm_log_semantics_and_valid_truncation(self):
+        log = self.pwm_log()
+        self.assertEqual(log.time_sources['T'], 'PWM_ISR_sample')
+        self.assertEqual(log.truncated, {0: (1, 150)})
+        self.assertFalse(log.integrity_issues)
+
+    def test_pwm_missing_cut_or_time_metadata_is_invalid(self):
+        for prefix in ('#TRUNC,', '#TIME,', '#READY'):
+            with self.subTest(prefix=prefix):
+                log = self.pwm_log(lambda lines: [x for x in lines if not x.startswith(prefix)])
+                self.assertTrue(log.integrity_issues)
+
+    def test_pwm_error_or_invented_cut_is_invalid(self):
+        for old, new in [('pwmerr=0', 'pwmerr=1'), ('#TRUNC,0,1,150', '#TRUNC,0,3,150')]:
+            log = self.pwm_log(lambda lines: [x.replace(old, new) for x in lines])
+            self.assertTrue(log.integrity_issues)
+
+    def test_pwm_frame_csv_marks_cut_and_preserves_time_source(self):
+        h = 75_000_000
+        lines = ['#SESSION,START,pwm', '#LOG,SensorSync-logger,2,tick_hz=75000000',
+                 '#TIME,T=PWM_ISR_sample,S=GPIO_ISR_sample,Z=sentence_read,P=GPIO_ISR_sample',
+                 '#TRIG,0,FX10E-1,33,25,ah=1', '#TRIG,1,FX10E-2,4,25,ah=1',
+                 '#STROBE,0,FX10E_EXP-1,18,ah=1', '#READY']
+        for i in range(21):
+            body = f'GPZDA,0000{i:02d}.00,09,09,2026,00,00'
+            checksum = 0
+            for c in body:
+                checksum ^= ord(c)
+            lines += [f'P,{i+1},{(i+1)*h}', f'Z,{i+1},{(i+1)*h+h//5},${body}*{checksum:02X}']
+        t = 11 * h
+        lines += [f'T,1,0,1,{t}', f'T,1,1,1,{t}', f'S,1,0,1,{t+75}', f'S,2,0,0,{t+750}',
+                  f'#TRUNC,0,1,{t+1500}',
+                  '#HFINAL ppsdrops=0 todtrunc=0 tdrops=0 sdrops=0 host=0 pwmerr=0 trunc=1',
+                  '#SESSION,STOP,pwm']
+        with tempfile.TemporaryDirectory() as folder:
+            log, out, edges = [Path(folder) / x for x in ('pwm.log', 'frames.csv', 'edges.csv')]
+            log.write_text('\n'.join(lines) + '\n')
+            subprocess.run([sys.executable, str(ROOT / 'postprocess.py'), str(log), '-o', str(out),
+                            '--edges', str(edges), '--tod-scale', 'utc', '--convention', 'preceding'],
+                           check=True, capture_output=True, text=True)
+            with out.open() as f:
+                frame = list(csv.DictReader(f))[0]
+            self.assertTrue(int(frame['flags']) & 0x80)
+            self.assertFalse(int(frame['flags']) & 0x40)
+            self.assertEqual(frame['trigger_time_source'], 'PWM_ISR_sample')
+            self.assertEqual(frame['strobe_time_source'], 'GPIO_ISR_sample')
+            with edges.open() as f:
+                self.assertEqual(list(csv.DictReader(f))[0]['time_source'], 'PWM_ISR_sample')
+
 
 class FakeBoard:
     def __init__(self, stop_delay=0, start_delay=0, final_health=True, stop_ack=True):
@@ -97,6 +160,9 @@ class FakeBoard:
         self.stop_ack = stop_ack
         self.commands = []
         self.path = None
+        self.ready_ack = True
+        self.ready_delay = 0
+        self.protocol_version = 2
         self.closed = threading.Event()
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
@@ -123,12 +189,17 @@ class FakeBoard:
                         if self.closed.wait(self.start_delay):
                             return
                         self.send(f'#SESSION,START,{self.path}')
-                        self.send('#LOG,SensorSync-logger,1,tick_hz=75000000')
+                        self.send(f'#LOG,SensorSync-logger,{self.protocol_version},tick_hz=75000000')
+                        self.send('#TIME,T=PWM_ISR_sample,S=GPIO_ISR_sample,Z=sentence_read,P=GPIO_ISR_sample')
+                        if self.closed.wait(self.ready_delay):
+                            return
+                        if self.ready_ack:
+                            self.send('#READY')
                     elif cmd == 'STOP':
                         if self.closed.wait(self.stop_delay):
                             return
                         if self.final_health:
-                            self.send('#HFINAL ppsdrops=0 todtrunc=0 tdrops=0 sdrops=0 host=0 skip=0 stall=0')
+                            self.send('#HFINAL ppsdrops=0 todtrunc=0 tdrops=0 sdrops=0 host=0 pwmerr=0 trunc=0')
                         if self.stop_ack:
                             self.send(f'#SESSION,STOP,{self.path}')
             except (OSError, ValueError):
@@ -149,12 +220,21 @@ class NativeTests(unittest.TestCase):
         cls.build = tempfile.TemporaryDirectory(prefix='sensorsync_tests_')
         cls.client = Path(cls.build.name) / 'session_client'
         cls.channels = Path(cls.build.name) / 'channels_test'
+        cls.leds = Path(cls.build.name) / 'leds_test'
+        cls.session = Path(cls.build.name) / 'session_test'
         common = ['g++', '-O2', '-Wall', '-Wextra', '-Werror']
         subprocess.run(common + ['-std=c++20', '-pthread', '-DSESSION_CLIENT_DEMO', str(ROOT / 'session_client.cpp'),
                                  '-o', str(cls.client)], check=True, capture_output=True)
         subprocess.run(common + ['-std=c++17', '-I', str(ROOT / 'tests/fakes'), '-I', str(ROOT),
                                  str(ROOT / 'tests/channels_test.cpp'), str(ROOT / 'channels.cpp'),
                                  '-o', str(cls.channels)], check=True, capture_output=True)
+        subprocess.run(common + ['-std=c++17', '-I', str(ROOT / 'tests/fakes'), '-I', str(ROOT),
+                                 str(ROOT / 'tests/leds_test.cpp'), str(ROOT / 'leds.cpp'),
+                                 '-o', str(cls.leds)], check=True, capture_output=True)
+
+        subprocess.run(common + ['-std=c++20', '-Wno-volatile', '-I', str(ROOT / 'tests/fakes'), '-I', str(ROOT),
+                                 str(ROOT / 'tests/session_test.cpp'), str(ROOT / 'channels.cpp'),
+                                 '-o', str(cls.session)], check=True, capture_output=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -181,12 +261,46 @@ class NativeTests(unittest.TestCase):
                               env=self.env, capture_output=True, text=True, timeout=12)
 
     def start(self):
-        result = self.ctl('start', str(self.path), '0:25,1:25,2:5,3:7')
+        result = self.ctl('start', str(self.path), 'FX:25,JAI:5')
         self.assertEqual(result.returncode, 0, result.stderr)
         return Path(result.stdout.strip())
 
-    def test_actual_channels_scheduler(self):
+    def test_actual_hardware_pwm_groups(self):
         subprocess.run([str(self.channels)], check=True, capture_output=True)
+
+    def test_actual_firmware_session_commands(self):
+        subprocess.run([str(self.session)], check=True, capture_output=True)
+
+    def test_start_waits_for_hardware_ready(self):
+        self.board.ready_delay = .5
+        t0 = time.monotonic()
+        self.start()
+        self.assertGreaterEqual(time.monotonic() - t0, .5)
+        self.assertIn('freq=FX:25,JAI:5', self.board.commands[0])
+        self.assertEqual(self.ctl('stop').returncode, 0)
+
+    def test_missing_ready_rejects_start(self):
+        self.board.ready_ack = False
+        result = self.ctl('start', str(self.path), 'FX:25,JAI:5')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '')
+
+    def test_old_firmware_rejected(self):
+        self.board.protocol_version = 1
+        self.assertNotEqual(self.ctl('start', str(self.path), 'FX:25,JAI:5').returncode, 0)
+
+    def test_old_channel_syntax_rejected_before_start(self):
+        self.assertNotEqual(self.ctl('start', str(self.path), '0:25,1:25').returncode, 0)
+        self.assertFalse(any(cmd.startswith('START ') for cmd in self.board.commands))
+
+    def test_pwm_logging_error_fails_the_run(self):
+        log = self.start()
+        self.board.send('#H pwmerr=1 host=0')
+        self.wait_failed(log)
+        self.assertNotEqual(self.ctl('stop').returncode, 0)
+
+    def test_actual_led_activity(self):
+        subprocess.run([str(self.leds)], check=True, capture_output=True)
 
     def test_start_waits_for_ack_stop_waits_for_final_tail(self):
         self.board.start_delay = .4
@@ -254,7 +368,7 @@ class NativeTests(unittest.TestCase):
 
     def test_reported_loss_fails_and_new_does_not_hide_failure(self):
         log = self.start()
-        self.board.send('#H ppsdrops=0 todtrunc=0 tdrops=0 sdrops=0 host=1 skip=0 stall=0')
+        self.board.send('#H ppsdrops=0 todtrunc=0 tdrops=0 sdrops=0 host=1 pwmerr=0 trunc=0')
         self.wait_failed(log)
         self.assertNotEqual(self.ctl('new', str(self.path)).returncode, 0)
         self.assertEqual(sum(cmd.startswith('START ') for cmd in self.board.commands), 1)

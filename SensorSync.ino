@@ -6,11 +6,11 @@
 //
 //  Log lines ('#' = comment / status):
 //    #SESSION,START,<path>                         session begin (path echo only)
-//    #LOG,SensorSync-logger,1,tick_hz=<f>          header
+//    #LOG,SensorSync-logger,2,tick_hz=<f>          header
 //    #TRIG,<i>,<name>,<pin>,<freq>,ah=<0|1>        per trigger channel
 //    #STROBE,<i>,<name>,<pin>,ah=<0|1>             per strobe channel
 //    P,<seq>,<tick>                                PPS edge
-//    T,<seq>,<ch>,<level>,<tick>                   trigger edge (sample after GPIO write)
+//    T,<seq>,<ch>,<level>,<tick>                   trigger PWM handler sample
 //    S,<seq>,<ch>,<level>,<tick>                   strobe edge
 //    Z,<seq>,<tick>,<raw NMEA sentence>            ToD sentence + read-out tick
 //    #H / #Ht / #Hs                                health, every 5 s while running
@@ -21,6 +21,7 @@
 
 #include "channels.h"
 #include "config.h"
+#include "leds.h"
 #include "timebase.h"
 #include "timesync.h"
 
@@ -40,12 +41,6 @@ static void ppsIsr() {
 		timesync::onPpsEvent(timebase::now());
 	}
 }
-
-// GPT1 status word forwarded from the timebase ISR
-static void gptHook(uint32_t sr) {
-	channels::gptIsr(sr);
-}
-
 
 // ---------------------------------------------------------------------------
 // Output discipline: never block loop() on USB CDC (blocks ~120 ms with an
@@ -83,54 +78,53 @@ static bool waitTx(int bytes, uint32_t timeout_ms) {
 
 // ---------------------------------------------------------------------------
 static void printHealth(bool final) {
-	// The aggregate line fits in 512 B. Optional channel lines reserve their own space.
-	if (Serial.availableForWrite() < 512) {
-		return;
-	}
-	unsigned long long skipped = 0, stalled = 0;
-	for (uint8_t i = 0; i < TRIG_MAX; ++i) {
-		skipped += channels::skippedCount(i);
-		stalled += channels::stalledCount(i);
-	}
-	Serial.printf(final
-		? "#HFINAL up=%lu en=%d pps=%lu ppsdt=%.6f ppsdrops=%lu tod=%lu todb=%lu todtrunc=%lu tdrops=%lu sdrops=%lu host=%lu skip=%llu stall=%llu\n"
-		: "#H up=%lu en=%d pps=%lu ppsdt=%.6f ppsdrops=%lu tod=%lu todb=%lu todtrunc=%lu tdrops=%lu sdrops=%lu host=%lu skip=%llu stall=%llu\n",
-				  millis(), channels::enabled() ? 1 : 0, timesync::ppsRawCount(), timesync::lastPpsIntervalSec(),
-				  timesync::ppsDrops(), timesync::todCount(), timesync::todBytes(), timesync::todTruncated(),
-					  channels::trigDrops(), channels::strobeDrops(), static_cast<unsigned long>(g_host_drops), skipped, stalled);
-	// The final aggregate carries every loss counter, without competing with the STOP marker.
-	if (final) return;
-	for (uint8_t i = 0; i < TRIG_MAX; i++) {
-		if (Serial.availableForWrite() < 128) return;
-		Serial.printf("#Ht %u %-8s n=%lu skip=%lu stall=%lu\n", i, TRIG_CFG[i].name, channels::trigCount(i),
-					  channels::skippedCount(i), channels::stalledCount(i));
-	}
-	for (uint8_t i = 0; i < STROBE_MAX; i++) {
-		if (Serial.availableForWrite() < 128) return;
-		Serial.printf("#Hs %u %-10s n=%lu\n", i, STROBE_CFG[i].name, channels::strobeCount(i));
-	}
+    if (Serial.availableForWrite() < 512) return;
+    const uint32_t errors = channels::pwmErrors(0) + channels::pwmErrors(1);
+    uint32_t seq; uint64_t tick;
+    const unsigned cuts = unsigned(channels::truncation(0, seq, tick)) + unsigned(channels::truncation(1, seq, tick));
+    Serial.printf(final
+        ? "#HFINAL up=%lu en=%d pps=%lu ppsdt=%.6f ppsdrops=%lu tod=%lu todb=%lu todtrunc=%lu tdrops=%lu sdrops=%lu host=%lu pwmerr=%lu trunc=%u\n"
+        : "#H up=%lu en=%d pps=%lu ppsdt=%.6f ppsdrops=%lu tod=%lu todb=%lu todtrunc=%lu tdrops=%lu sdrops=%lu host=%lu pwmerr=%lu trunc=%u\n",
+        millis(), channels::enabled() ? 1 : 0, timesync::ppsRawCount(), timesync::lastPpsIntervalSec(),
+        timesync::ppsDrops(), timesync::todCount(), timesync::todBytes(), timesync::todTruncated(),
+        channels::trigDrops(), channels::strobeDrops(), static_cast<unsigned long>(g_host_drops),
+        static_cast<unsigned long>(errors), cuts);
+    if (final) return;
+    for (uint8_t i = 0; i < TRIG_MAX; ++i) {
+        if (Serial.availableForWrite() < 128) return;
+        Serial.printf("#Ht %u %s n=%lu pwmerr=%lu\n", i, TRIG_CFG[i].name,
+                      channels::trigCount(i), channels::pwmErrors(i / 2));
+    }
+    for (uint8_t i = 0; i < STROBE_MAX; ++i) {
+        if (Serial.availableForWrite() < 128) return;
+        Serial.printf("#Hs %u %s n=%lu\n", i, STROBE_CFG[i].name, channels::strobeCount(i));
+    }
 }
 
-
-// ---------------------------------------------------------------------------
-// Header: tick_hz + channel map; postprocess.py needs it to be self-contained.
-// Re-emitted on 'h', so a mid-session (re)connect still captures it.
-static void printHeader() {
-	if (!waitTx(512, 250)) {  // all lines fit in 512 B once room exists
-		return;
-	}
-	Serial.printf("#LOG,SensorSync-logger,1,tick_hz=%.3f\n", timebase::nominalHz());
-	for (uint8_t i = 0; i < TRIG_MAX; i++) {
-		// effective rate: config.h default, or the session's freq= override
-		Serial.printf("#TRIG,%u,%s,%u,%.4f,ah=%u\n", i, TRIG_CFG[i].name, TRIG_CFG[i].pin, channels::freqHz(i),
-					  TRIG_CFG[i].active_high ? 1 : 0);
-	}
-	for (uint8_t i = 0; i < STROBE_MAX; i++) {
-		Serial.printf("#STROBE,%u,%s,%u,ah=%u\n", i, STROBE_CFG[i].name, STROBE_CFG[i].pin, STROBE_CFG[i].active_high ? 1 : 0);
-	}
-	if (waitTx(160, 250)) {
-		Serial.println("#TIME,T=GPIO_write_sample,S=GPIO_ISR_sample,Z=sentence_read,P=GPIO_ISR_sample");
-	}
+static bool printHeader() {
+    if (!waitTx(128, 250)) return false;
+    Serial.printf("#LOG,SensorSync-logger,2,tick_hz=%.3f\n", timebase::nominalHz());
+    const auto requested = channels::requestedRates();
+    for (uint8_t g = 0; g < 2; ++g) {
+        if (!waitTx(192, 250)) return false;
+        const auto &t = channels::timing(g);
+        Serial.printf("#GROUP,%s,requested=%.8f,actual=%.8f,pulse_us=%.6f,clock_hz=%.6f,div=%u,period=%u,width=%u\n",
+                      trigger::name(static_cast<trigger::Group>(g)), requested.hz[g], t.actual_hz,
+                      t.pulse_us, t.clock_hz, 1u << t.prescale, t.period, t.width);
+    }
+    for (uint8_t i = 0; i < TRIG_MAX; ++i) {
+        if (!waitTx(128, 250)) return false;
+        Serial.printf("#TRIG,%u,%s,%u,%.8f,ah=%u\n", i, TRIG_CFG[i].name, TRIG_CFG[i].pin,
+                      channels::freqHz(i), TRIG_CFG[i].active_high ? 1 : 0);
+    }
+    for (uint8_t i = 0; i < STROBE_MAX; ++i) {
+        if (!waitTx(128, 250)) return false;
+        Serial.printf("#STROBE,%u,%s,%u,ah=%u\n", i, STROBE_CFG[i].name, STROBE_CFG[i].pin,
+                      STROBE_CFG[i].active_high ? 1 : 0);
+    }
+    if (!waitTx(128, 250)) return false;
+    Serial.println("#TIME,T=PWM_ISR_sample,S=GPIO_ISR_sample,Z=sentence_read,P=GPIO_ISR_sample");
+    return true;
 }
 
 
@@ -188,7 +182,7 @@ static void drainAll(uint32_t deadline_ms) {
 
 // ---------------------------------------------------------------------------
 // Session control (host-facing API).
-//   START [freq=<ch>:<hz>,...] [path]   zero all counts, optionally retune
+//   START [freq=FX:<hz>,JAI:<hz>] [path]   zero all counts, optionally retune
 //                 trigger rates, enable capture, emit #SESSION,START + header
 //   STOP          drain tail, emit #SESSION,STOP, park idle, clear counts
 // <path> is echo only (board cannot write the host filesystem); it makes the
@@ -197,7 +191,15 @@ static void drainAll(uint32_t deadline_ms) {
 static void closeRunningSession() {
 	g_running = false;
 	channels::setEnabled(false);
-	drainAll(500);	// flush the session tail before the marker
+	leds::reset();
+    // STOP may truncate a high pulse; no synthetic T falling edge is emitted.
+    for (uint8_t g = 0; g < 2; ++g) {
+        uint32_t seq; uint64_t tick;
+        if (channels::truncation(g, seq, tick) && waitTx(128, 250))
+            Serial.printf("#TRUNC,%u,%lu,%llu\n", g, static_cast<unsigned long>(seq),
+                          static_cast<unsigned long long>(tick));
+    }
+    drainAll(500); // flush the session tail before the marker
 	// Preserve final loss counters BEFORE resetStats/resetCounts. A normal STOP
 	// marker is emitted only after the final health block could be sent.
 	const bool final_stats_sent = waitTx(512, 250);
@@ -223,52 +225,36 @@ static void stopSession() {
 }
 
 
-// Apply a "freq=" START option: "<ch>:<hz>[,<ch>:<hz>...]", hz 0 = channel off.
-// Invalid items answer #ERR and keep the old rate; the header shows the truth.
-static void applyFreqSpec(char *spec) {
-	for (char *tok = strtok(spec, ","); tok; tok = strtok(nullptr, ",")) {
-		bool ok = false;
-		char *colon = strchr(tok, ':');
-		if (colon) {
-			*colon = 0;
-			char *e1 = nullptr;
-			char *e2 = nullptr;
-			const long ch = strtol(tok, &e1, 10);
-			const double hz = strtod(colon + 1, &e2);
-			ok = e1 && *e1 == 0 && e1 != tok && e2 && *e2 == 0 && e2 != colon + 1 && ch >= 0 && ch < TRIG_MAX &&
-				 channels::setFreqHz(static_cast<uint8_t>(ch), hz);
-			*colon = ':';  // restore for the error echo
-		}
-		if (!ok && Serial.availableForWrite() >= kLineMax) {
-			Serial.printf("#ERR,bad_freq,%s\n", tok);
-		}
-	}
-}
-
-
-static void startSession(const char *path, char *freqspec = nullptr) {
-	if (g_running) {
-		closeRunningSession();	// paired STOP marker for the old session
-	}
-	timesync::flushInput();
-	timesync::resetStats();
-	channels::resetCounts();
-	g_host_drops = 0;
-	if (freqspec) {
-		applyFreqSpec(freqspec);  // while disabled; new rates land in the header below
-	}
-
-	// announce, header first so no data line precedes it
-	strncpy(g_session_path, path ? path : "", sizeof(g_session_path) - 1);
-	g_session_path[sizeof(g_session_path) - 1] = 0;
-	if (waitTx(512, 250)) {	 // marker line can exceed kLineMax (long path)
-		Serial.printf("#SESSION,START,%s\n", g_session_path);
-	}
-	printHeader();
-
-	// go: PPS gated on g_running; triggers + strobe on channels::enabled()
-	g_running = true;
-	channels::setEnabled(true);
+// Validate the entire request before closing an existing session or changing rates.
+static void startSession(const char *path, const char *freqspec = nullptr) {
+    auto rates = channels::requestedRates();
+    if (!trigger::parseRates(freqspec, rates) || !channels::validateRates(rates)) {
+        if (waitTx(64, 50)) Serial.println("#ERR,bad_freq");
+        return;
+    }
+    if (g_running) closeRunningSession();
+    timesync::flushInput();
+    timesync::resetStats();
+    channels::resetCounts();
+    g_host_drops = 0;
+    leds::reset();
+    if (!channels::applyRates(rates)) {
+        if (waitTx(64, 50)) Serial.println("#ERR,pwm_config");
+        return;
+    }
+    strncpy(g_session_path, path ? path : "", sizeof(g_session_path) - 1);
+    g_session_path[sizeof(g_session_path) - 1] = 0;
+    if (!waitTx(512, 250)) return;
+    Serial.printf("#SESSION,START,%s\n", g_session_path);
+    if (!printHeader() || !waitTx(64, 250)) return; // no output without a complete header
+    g_running = true;
+    if (!channels::setEnabled(true)) {
+        if (waitTx(64, 50)) Serial.println("#ERR,pwm_start");
+        closeRunningSession();
+        return;
+    }
+    // Version 2 clients acknowledge only READY, after the hardware actually starts.
+    Serial.println("#READY");
 }
 
 
@@ -285,7 +271,7 @@ static void handleCommand(char *s) {
 		while (*p == ' ' || *p == '\t') {
 			p++;
 		}
-		// optional leading option: "freq=<ch>:<hz>[,...]", then the path
+		// optional leading option: "freq=FX:<hz>,JAI:<hz>", then the path
 		char *freq = nullptr;
 		if (strncmp(p, "freq=", 5) == 0) {
 			freq = p + 5;
@@ -318,13 +304,13 @@ static void handleCommand(char *s) {
 
 // ---------------------------------------------------------------------------
 void setup() {
+	leds::begin();
 	Serial.begin(115200);
 	uint32_t t0 = millis();
 	while (!Serial && (millis() - t0) < 3000) {
 	}
 
 	timebase::begin();
-	timebase::setIsrHook(gptHook);
 
 	// bias to idle level: floating PPS line reads quiet, not noisy
 	pinMode(PPS_PIN, PPS_RISING_EDGE ? INPUT_PULLDOWN : INPUT_PULLUP);
@@ -334,11 +320,16 @@ void setup() {
 	channels::begin();
 
 	// boot idle: triggers off, nothing counted, until START
-	Serial.println("# SensorSync-logger ready (idle). commands: START [freq=ch:hz,...] [path] | STOP | s (status) | h (header)");
+	Serial.println("# SensorSync-logger ready (idle). commands: START [freq=FX:hz,JAI:hz] [path] | STOP | s (status) | h (header)");
 }
 
 // ---------------------------------------------------------------------------
 void loop() {
+    channels::pollHealth();
+    if (g_running && channels::faulted()) {
+        if (waitTx(64, 50)) Serial.println("#ERR,pwm_event_loss");
+        closeRunningSession();
+    }
 	char buf[kLineMax];
 
 	// drain only while a session runs; idle ISRs push nothing
@@ -403,6 +394,9 @@ void loop() {
 			cmd_overflow = true;
 		}
 	}
+
+	// Visible activity from the counters; keep GPIO work out of the timing ISRs.
+	if (g_running) leds::poll();
 
 	// heartbeat: #H while running, #IDLE while waiting
 	static uint32_t last = 0;

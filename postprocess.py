@@ -16,8 +16,9 @@ Only dependency: numpy.
 Usage requires explicitly verified --tod-scale (utc/gps) and --convention
 (preceding/following). GPS conversion also requires the applicable --leap.
 Output CSV rows describe strobe observations; they are not camera BlockIDs.
-Current T ticks are samples immediately after GPIO writes; older logs use scheduled
-compares (see #TIME). S and P ticks are GPIO ISR samples. Fits do not remove path latency.
+T ticks use the #TIME source: PWM ISR samples in version 2, GPIO write samples or
+scheduled compares in older logs. S and P are GPIO ISR samples. Fits do not remove
+interrupt or path latency. #TRUNC marks a STOP-shortened final trigger pulse.
 """
 
 import argparse
@@ -129,6 +130,11 @@ class Log:
     stopped: bool = False
     final_health: bool = False
     integrity_issues: set = field(default_factory=set)
+    version: int = 1
+    time_sources: dict = field(default_factory=dict)
+    ready: bool = False
+    truncated: dict = field(default_factory=dict)  # group -> (last rise seq, stop sample)
+    final_truncations: int = 0
 
 
 def _has_data(lg):
@@ -180,12 +186,32 @@ def parse_log(path):
                         final = line.startswith('#HFINAL ')
                         cur.final_health |= final
                         fields = dict(tok.split('=', 1) for tok in line.split() if '=' in tok)
-                        for key in ('ppsdrops', 'todtrunc', 'tdrops', 'sdrops', 'host', 'skip', 'stall'):
+                        for key in ('ppsdrops', 'todtrunc', 'tdrops', 'sdrops', 'host') + (('pwmerr',) if cur.version >= 2 else ('skip', 'stall')):
                             if key in fields and int(fields[key]) != 0:
                                 cur.integrity_issues.add(f'{key}={fields[key]}')
                             if final and key not in fields:
                                 cur.integrity_issues.add(f'final health missing {key}')
+                        if final and cur.version >= 2:
+                            if 'trunc' not in fields:
+                                cur.integrity_issues.add('final health missing trunc')
+                            else:
+                                cur.final_truncations = int(fields['trunc'])
+                    elif line == '#READY':
+                        if cur.ready:
+                            cur.integrity_issues.add('duplicate READY')
+                        cur.ready = True
+                    elif line.startswith('#TIME,'):
+                        cur.time_sources = dict(tok.split('=', 1) for tok in line.split(',')[1:])
+                    elif line.startswith('#TRUNC,'):
+                        p = line.split(',')
+                        if len(p) != 4:
+                            raise ValueError('bad truncation')
+                        group, seq, tick = map(int, p[1:])
+                        if group not in (0, 1) or seq < 1 or seq % 2 != 1 or tick < 0 or group in cur.truncated:
+                            raise ValueError('bad truncation')
+                        cur.truncated[group] = (seq, tick)
                     elif line.startswith('#LOG'):
+                        cur.version = int(line.split(',')[2])
                         for tok in line.split(','):
                             if tok.startswith('tick_hz='):
                                 cur.tick_hz = float(tok[8:])
@@ -229,6 +255,17 @@ def parse_log(path):
                 cur.malformed += 1
                 continue
     sessions.append(cur)
+    for lg in sessions:
+        if lg.version >= 2:
+            if lg.version != 2 or not lg.ready or lg.time_sources.get('T') != 'PWM_ISR_sample':
+                lg.integrity_issues.add('missing/unsupported PWM session metadata')
+            if lg.final_truncations != len(lg.truncated):
+                lg.integrity_issues.add('missing/inconsistent truncation records')
+            for group, (seq, tick) in lg.truncated.items():
+                for ch in (2 * group, 2 * group + 1):
+                    edges = lg.trig.get(ch, [])
+                    if not edges or edges[-1][0] != seq or edges[-1][1] != 1 or edges[-1][2] > tick:
+                        lg.integrity_issues.add('truncation does not identify final rising edge')
     return sessions
 
 
@@ -524,6 +561,9 @@ def main():
         print(f"  ! log integrity incomplete/unverified: {sorted(lg.integrity_issues)}; "
               "CSV observations will carry flag 0x40", file=sys.stderr)
 
+    if lg.time_sources.get('T') == 'PWM_ISR_sample':
+        print('  T timestamps include PWM interrupt latency; a later T sample stays unmatched, '
+              'and latency_us is an observed difference, not calibrated camera latency.', file=sys.stderr)
     anchors, _ = build_anchors(lg, args.convention)
     if len(anchors) < 4:
         print("FATAL: not enough PPS<->ToD anchors to fit; check ToD wiring / --convention", file=sys.stderr)
@@ -558,14 +598,14 @@ def main():
     if args.edges:
         with open(args.edges, 'x', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow("kind,ch,seq,level,tick,sec,ns,fit_rms_ns,n_anchors,centered,fit_valid".split(','))
+            writer.writerow("kind,ch,seq,level,tick,sec,ns,fit_rms_ns,n_anchors,centered,fit_valid,time_source".split(','))
             for kind, store in (('T', lg.trig), ('S', lg.strobe)):
                 for ch, ev in store.items():
                     for seq, level, tick in ev:
                         w, fq, rms, n, ok, cen = fitter.gnss(tick)
                         s, ns = split(to_out(w), fq) if ok else ('', '')
                         writer.writerow([kind, ch, seq, level, tick, s, f"{ns:09d}" if ok else '',
-                                         f"{rms*1e9:.0f}" if ok else '', n, int(cen), int(ok)])
+                                         f"{rms*1e9:.0f}" if ok else '', n, int(cen), int(ok), lg.time_sources.get(kind, 'legacy_unspecified')])
         print(f"wrote per-edge CSV: {args.edges}", file=sys.stderr)
 
     # per-frame CSV
@@ -575,7 +615,7 @@ def main():
         writer.writerow(("strobe,name,frame,start_sec,start_ns,end_sec,end_ns,mid_sec,mid_ns,"
                          "dur_us,trig_sec,trig_ns,latency_us,fit_rms_ns,n_anchors,start_seq,trig_seq,flags,"
                          "start_tick,end_tick,trig_tick,association_verified,output_time_scale,"
-                         "tod_scale,pps_convention,leap_seconds").split(','))
+                         "tod_scale,pps_convention,leap_seconds,trigger_time_source,strobe_time_source").split(','))
         for sch, ev in sorted(lg.strobe.items()):
             if not ev:
                 continue
@@ -619,6 +659,8 @@ def main():
                 trig_out = tr_ns = ''
                 lat_us = ''
                 tseq = fr['trig_seq'] if fr['trig_seq'] is not None else ''
+                if tch is not None and lg.truncated.get(tch // 2, (None,))[0] == tseq:
+                    flags |= 0x80  # trigger pulse shortened by STOP; not a normal frame
                 if fr['trig_tick'] is not None:
                     tw, tf, _, _, ok_t, _ = fitter.gnss(fr['trig_tick'])
                     if ok_t:
@@ -634,14 +676,16 @@ def main():
                                  trig_out, tr_ns, lat_us, f"{rms_s*1e9:.0f}" if ok_s else '', n_s,
                                  fr['start_seq'], tseq, flags, fr['start_tick'], fr['end_tick'],
                                  fr['trig_tick'], 0, 'gps' if args.gps else 'utc', args.tod_scale,
-                                 args.convention, args.leap if args.leap is not None else ''])
+                                 args.convention, args.leap if args.leap is not None else '',
+                                 lg.time_sources.get('T', 'legacy_unspecified'),
+                                 lg.time_sources.get('S', 'legacy_unspecified')])
                 nframes += 1
 
     print(f"wrote {nframes} frames -> {args.out}"
           + ("  (GPS seconds)" if args.gps else "  (UTC/Unix seconds)"), file=sys.stderr)
     print("flags: 0x01 incomplete-time-fit  0x02 no-trigger-time(unmatched/fit-fail)  "
           "0x04 exposure-suspect(lost edge)  0x08 non-centered-fit(edge/gap)  0x10 missing-end-edge  "
-          "0x40 log-integrity-incomplete; "
+          "0x40 log-integrity-incomplete  0x80 trigger-truncated-on-STOP; "
           "trigger matching is heuristic, association_verified=0", file=sys.stderr)
     return 0
 

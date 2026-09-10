@@ -4,7 +4,6 @@ namespace timebase {
 
 	static volatile uint64_t g_rollover = 0;  // low 32 bits always zero
 	static double g_nominal_hz = 0.0;
-	static IsrHook g_hook = nullptr;		  // forwarded the GPT1 status word each interrupt
 
 
 	double nominalHz() {
@@ -12,22 +11,14 @@ namespace timebase {
 	}
 
 
-	void setIsrHook(IsrHook h) {
-		g_hook = h;
-	}
-
-
 	// -----------------------------------------------------------------------------
-	// GPT1 ISR: rollover + dispatch to trigger scheduler
+	// GPT1 ISR: extend the free-running time ruler
 	static void gpt1_isr() {
 		uint32_t sr = GPT1_SR;
 		GPT1_SR = sr;				// write-1-clear
 
 		if (sr & SS_GPT_SR_ROV) {
 			g_rollover += 0x100000000ULL;
-		}
-		if (g_hook) {
-			g_hook(sr);
 		}
 
 		asm volatile("dsb");  // flag clear must retire before exit (else re-entry)
