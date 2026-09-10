@@ -1,4 +1,5 @@
 import csv
+import math
 import os
 from pathlib import Path
 import pty
@@ -103,6 +104,12 @@ class FakeBoard:
         self.idle_reply = True
         self.status_reply = '#IDLE,up=123'
         self.start_error = None
+        self.version = 2
+        self.ready_ack = True
+        self.ready_delay = 0
+        self.rates = {'FX': 50.0, 'JAI': 0.0}
+        self.pwm_error = 0
+        self.truncated = []
         self.sync_seen = threading.Event()
         self.commands = []
         self.path = None
@@ -134,15 +141,40 @@ class FakeBoard:
                         continue
                     if cmd.startswith('START '):
                         payload = cmd[6:]
+                        rates = dict(self.rates)
                         if payload.startswith('freq='):
-                            payload = payload.split(' ', 1)[1]
-                        self.path = payload
-                        if self.closed.wait(self.start_delay):
-                            return
+                            spec, _, payload = payload.partition(' ')
+                            seen = set()
+                            valid = True
+                            for item in spec[5:].split(','):
+                                group, sep, value = item.partition(':')
+                                try:
+                                    hz = float(value)
+                                except ValueError:
+                                    valid = False
+                                    break
+                                if (not sep or group not in rates or group in seen or not math.isfinite(hz) or
+                                        not (hz == 0 or (hz >= 20 if group == 'FX' else 1 <= hz <= 10))):
+                                    valid = False
+                                    break
+                                seen.add(group)
+                                rates[group] = hz
+                            if not valid:
+                                self.send('#ERR,bad_freq')
+                                continue
                         if self.start_error:
                             self.send(self.start_error)
+                            continue  # v2 rejects the entire START, remaining idle
+                        self.path = payload
+                        self.rates = rates
+                        if self.closed.wait(self.start_delay):
+                            return
                         self.send(f'#SESSION,START,{self.path}')
-                        self.send('#LOG,SensorSync-logger,1,tick_hz=75000000')
+                        self.send(f'#LOG,SensorSync-logger,{self.version},tick_hz=75000000')
+                        if self.version == 2 and self.ready_ack:
+                            if self.closed.wait(self.ready_delay):
+                                return
+                            self.send('#READY')
                     elif cmd == 'STOP':
                         if self.path is None:
                             if self.idle_reply:
@@ -150,8 +182,12 @@ class FakeBoard:
                             continue
                         if self.closed.wait(self.stop_delay):
                             return
+                        for record in self.truncated:
+                            self.send(record)
                         if self.final_health:
-                            self.send('#HFINAL ppsdrops=0 todtrunc=0 tdrops=0 sdrops=0 host=0 skip=0 stall=0')
+                            extra = (f'pwmerr={self.pwm_error} trunc={len(self.truncated)}'
+                                     if self.version == 2 else 'skip=0 stall=0')
+                            self.send('#HFINAL ppsdrops=0 todtrunc=0 tdrops=0 sdrops=0 host=0 ' + extra)
                         if self.stop_ack:
                             self.send(f'#SESSION,STOP,{self.path}')
                         self.path = None
@@ -215,7 +251,7 @@ class NativeTests(unittest.TestCase):
                               env=self.env, capture_output=True, text=True, timeout=12)
 
     def start(self):
-        result = self.ctl('start', str(self.path), '0:25,1:25,2:5,3:7')
+        result = self.ctl('start', str(self.path), 'FX:25,JAI:5')
         self.assertEqual(result.returncode, 0, result.stderr)
         return Path(result.stdout.strip())
 
@@ -281,11 +317,11 @@ class NativeTests(unittest.TestCase):
         self.assertFalse(any(cmd.startswith('START ') for cmd in self.board.commands))
 
     def test_real_start_error_is_not_swallowed_as_startup_noise(self):
-        self.board.start_error = '#ERR,bad_freq,0:50'
+        self.board.start_error = '#ERR,bad_freq'
         result = self.run_client()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('START rejected: #ERR,bad_freq,0:50', result.stderr)
-        self.assertIn('#ERR,bad_freq,0:50', (self.path / 'direct.log').read_text())
+        self.assertIn('START rejected (freq=FX:50): #ERR,bad_freq', result.stderr)
+        self.assertIn('#ERR,bad_freq', (self.path / 'direct.log').read_text())
         self.assertEqual(sum(cmd.startswith('START ') for cmd in self.board.commands), 1)
 
     def test_oversized_startup_reply_never_starts_capture(self):
@@ -308,6 +344,41 @@ class NativeTests(unittest.TestCase):
 
     def test_actual_channels_scheduler(self):
         subprocess.run([str(self.channels)], check=True, capture_output=True)
+
+    def test_command_uses_named_groups_and_waits_for_ready(self):
+        self.board.ready_delay = .5
+        begin = time.monotonic()
+        log = self.start()
+        self.assertGreaterEqual(time.monotonic() - begin, .5)
+        starts = [cmd for cmd in self.board.commands if cmd.startswith('START ')]
+        self.assertEqual(starts, [f'START freq=FX:25,JAI:5 {log}'])
+        self.assertEqual(self.ctl('stop').returncode, 0)
+        self.assertIn('#READY', log.read_text())
+
+    def test_session_marker_without_ready_does_not_start(self):
+        self.board.ready_ack = False
+        result = self.run_client()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('#READY acknowledgement missing', result.stderr)
+
+    def test_v1_firmware_cannot_silently_acknowledge_v2_start(self):
+        self.board.version = 1
+        result = self.run_client()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('SensorSync protocol v2 required', result.stderr)
+
+    def test_v2_final_health_and_audited_high_pulse_cut(self):
+        log = self.start()
+        self.board.truncated = ['#TRUNC,0,1,75000000']
+        self.assertEqual(self.ctl('stop').returncode, 0)
+        self.assertIn('pwmerr=0 trunc=1', log.read_text())
+
+    def test_v2_pwm_error_is_fatal(self):
+        log = self.start()
+        self.board.send('#H ppsdrops=0 todtrunc=0 tdrops=0 sdrops=0 host=0 pwmerr=1 trunc=0')
+        self.wait_failed(log)
+        self.assertNotEqual(self.ctl('stop').returncode, 0)
+        self.assertEqual(sum(cmd.startswith('START ') for cmd in self.board.commands), 1)
 
     def test_start_waits_for_ack_stop_waits_for_final_tail(self):
         self.board.start_delay = .4
@@ -383,7 +454,7 @@ class NativeTests(unittest.TestCase):
 
     def test_reported_loss_fails_and_new_does_not_hide_failure(self):
         log = self.start()
-        self.board.send('#H ppsdrops=0 todtrunc=0 tdrops=0 sdrops=0 host=1 skip=0 stall=0')
+        self.board.send('#H ppsdrops=0 todtrunc=0 tdrops=0 sdrops=0 host=1 pwmerr=0 trunc=0')
         self.wait_failed(log)
         self.assertNotEqual(self.ctl('new', str(self.path)).returncode, 0)
         self.assertEqual(sum(cmd.startswith('START ') for cmd in self.board.commands), 1)

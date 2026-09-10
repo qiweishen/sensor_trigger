@@ -8,7 +8,7 @@ and fits ticks to UTC or GPS time offline. Triggers free-run; they are not GNSS-
 
 ```text
 INS PPS -> input buffer -> GPIO 19       Teensy 4.1
-INS NMEA -> MAX3232 -> Serial1 RX0       GPT1 counter / trigger scheduler
+INS NMEA -> MAX3232 -> Serial1 RX0       GPT1 counter / FlexPWM2 outputs
 Camera Trigger In <- 9 V driver <- GPIO outputs
 Camera Exposure Active -> input buffers -> GPIO inputs
 Teensy USB -> session_client -> raw log -> postprocess.py -> frames.csv
@@ -22,15 +22,16 @@ GPIO numbers below, not the schematic symbol's physical terminal numbers.
 | Channel / signal | Trigger GPIO | Exposure GPIO | Default trigger rate |
 |---|---:|---:|---:|
 | 0: FX10E-1 | 33 | 18 | 50 Hz |
-| 1: FX10E-2 | 4 | 10 | off |
+| 1: FX10E-2 | 4 | 10 | 50 Hz |
 | 2: JAI-1 | 37 | 14 | off |
 | 3: JAI-2 | 36 | 15 | off |
 | PPS | input 19 | — | rising edge |
 | NMEA | Serial1 RX: 0; TX: 1 | — | 115200, 8N1 |
 
-Only the first trigger is enabled by default, preserving the single-camera bring-up
-configuration. All four wired trigger pins are explicitly configured and parked
-low when disabled. Enable others with `START freq=...`. Channel counts are derived
+The FX pair (channels 0/1) defaults to 50 Hz; the JAI pair (channels 2/3) defaults
+to disabled. Each pair shares one hardware PWM rate and cannot be enabled or
+disabled independently. All four wired trigger pins are parked low when their
+group is disabled. Configure groups with `START freq=FX:50,JAI:0`. Channel counts are derived
 from the configuration arrays; do not add empty entries. GPIO conflicts involving
 trigger outputs, Serial1, PPS and exposure inputs are rejected at compile time.
 
@@ -56,27 +57,22 @@ U402. Do not treat a 12 V connection alone as MCU power.
 ## Timing model
 
 GPT1 runs at nominally 75 MHz, software-extended to 64 bits across its approximately
-57.3 s rollover. One output compare schedules the earliest pending edge among all
-four channels. Each channel retains its own period, phase and pulse width; there
-is no allocation or unbounded waiting in the interrupt handler.
-
-The default pulse width is 50 µs, timed from the sampled GPIO rise. A delayed ISR
-may lengthen a pulse. Completely missed pulse windows are skipped and counted;
-missed periods are not compressed into a burst. If the scheduler cannot make
-progress within its bounded work limit, outputs are parked and `stall` increments.
-A STOP followed by START resets the scheduler.
+57.3 s rollover. FlexPWM2 generates the two output pairs independently of ISR
+latency. The requested pulse width defaults to 50 µs and is quantized to the PWM
+clock; `#GROUP` records the actual timing. PWM interrupts sample GPT1 for `T`
+records. Detected missing/ambiguous PWM observations or trigger-queue overflow
+park the outputs and increment `pwmerr`; these fail the host recording.
 
 Current log timestamps mean:
 
 | Stream | Timestamp meaning |
 |---|---|
 | `P` | GPIO PPS ISR sample |
-| `T` | GPT sample immediately after the GPIO output write |
+| `T` | GPT sample in the PWM interrupt handler; both members of a pair share it |
 | `S` | GPIO exposure ISR sample |
 | `Z` | Time when the NMEA terminator is read by the main loop |
 
-The 13.3 ns tick is **resolution, not guaranteed accuracy**. ISR latency, GPIO write
-completion, sequential channel handling and external circuitry all contribute
+The 13.3 ns tick is **resolution, not guaranteed accuracy**. ISR latency and external circuitry contribute
 measurement error. PPS fitting corrects the clock scale/drift; it cannot remove
 these path delays. The current firmware uses GPIO PPS only; no hardware-capture
 switch or self-test is provided. Older logs used scheduled compare values for most
@@ -133,10 +129,10 @@ Build the shared C++ client once, and rebuild it after source changes:
 ```bash
 g++ -std=c++20 -O2 -pthread -DSESSION_CLIENT_DEMO session_client.cpp -o session_client
 ./session_client /dev/ttyACM0 /tmp/run.log 5 25
-# Arguments: port, new log path, seconds (0 = until signal), trig0 Hz or freq=ch:hz,...
+# Arguments: port, new log path, seconds (0 = until signal), FX Hz or freq=FX:hz,JAI:hz
 ```
 
-The client creates a new file exclusively, waits for START acknowledgement, and
+The client creates a new file exclusively, waits for protocol v2 `#READY`, and
 on SIGINT/SIGTERM sends STOP, waits for final health and STOP acknowledgement, then
 flushes and synchronizes the file. A USB disconnect, reboot, unexpected IDLE,
 repeated START, protocol error or reported loss fails the run. It does not reconnect
@@ -147,13 +143,14 @@ The standalone client exits nonzero on failure.
 
 ```bash
 export SENSOR_PORT=/dev/serial/by-id/usb-Teensyduino_... # replace with the actual port
-LOG=$(./record_ctl.bash start /data/logs 0:25.5) || exit 1
+LOG=$(./record_ctl.bash start /data/logs FX:25.5,JAI:0) || exit 1
 ./record_ctl.bash status
 # ... acquire camera data ...
 ./record_ctl.bash stop || exit 1
 ```
 
-`start` prints a unique absolute log path only after the START acknowledgement.
+`start` prints a unique absolute log path only after `#READY` confirms PWM startup.
+`#SESSION,START` alone is insufficient; firmware without v2 `#READY` fails startup.
 `stop` reports success only after the client has validated STOP and finalized the
 file; an unconfirmed or lossy run returns nonzero. `new` stops the previous run and
 starts another only if the previous run completed successfully. No automatic START
@@ -170,7 +167,7 @@ For C++ integration, include `session_client.cpp` without `SESSION_CLIENT_DEMO`:
 
 ```cpp
 SensorSyncSession s;
-if (!s.open(port) || !s.start(log_path, {{0, 25.0}, {1, 25.0}, {2, 5.0}, {3, 5.0}})) {
+if (!s.open(port) || !s.start(log_path, {{0, 25.0}, {2, 5.0}})) {
     // Abort camera acquisition: timing session did not start successfully.
 }
 // During acquisition, poll s.ok(); end the camera epoch if it becomes false.
@@ -180,38 +177,47 @@ if (!s.ok()) {
 }
 ```
 
+The C++ API retains physical channel IDs: 0/1 configure the FX pair, and 2/3
+configure the JAI pair. The client converts these to named groups on the wire
+and rejects conflicting rates within a pair before creating a recording file.
+
 ## Board protocol and configuration
 
 USB CDC commands are newline-terminated; 115200 is a nominal USB baud setting.
-The board boots idle. `config.h` contains pins, defaults, pulse widths, phases and
+The board boots idle. `config.h` contains pins, defaults, pulse widths and
 interrupt priorities.
 
 | Command | Action |
 |---|---|
-| `START [freq=CH:HZ,...] [path]` | Close any old session, reset counts, emit header, start capture |
+| `START [freq=FX:HZ,JAI:HZ] [path]` | Validate rates, close any old session, emit header, start PWM and acknowledge with `#READY` |
 | `STOP` | Disable outputs/capture, drain queued events, emit final health and STOP |
 | `s` or `STATUS` | Health while running; IDLE otherwise |
 | `h` or `HEADER` | Reprint the current channel and timebase configuration |
 
-A frequency of 0 disables a channel. Enabled rates must be finite and at least
-1 Hz; periods must exceed the scheduler's timing margin. Omitted channels retain
-their previous effective rate until reboot. Invalid values emit `#ERR,bad_freq`
-and retain the old rate. Check `#TRIG` for the effective quantized rate. The path
-is echo-only; it does not make the board write to the host filesystem.
+A frequency of 0 disables a whole pair. Enabled FX rates must be finite and at
+least 20 Hz; JAI rates must be within 1–10 Hz. The firmware also checks whether
+the hardware clock, period and pulse width can represent the request. Omitted
+groups retain their previous rate until reboot. Numeric wire keys such as
+`freq=0:50` are rejected. Invalid requests emit `#ERR,bad_freq` without changing
+the existing session or rates. Check `#GROUP` and `#TRIG` for the quantized rate.
+The path is echo-only; it does not make the board write to the host filesystem.
 
 | Record | Meaning |
 |---|---|
 | `#SESSION,START,<path>` / `#SESSION,STOP,<path>` | Session boundaries |
-| `#LOG,SensorSync-logger,1,tick_hz=<f>` | Nominal timebase frequency |
+| `#LOG,SensorSync-logger,2,tick_hz=<f>` | Protocol version and nominal timebase frequency |
+| `#GROUP,<name>,requested=...,actual=...,pulse_us=...,clock_hz=...,div=...,period=...,width=...` | Requested and actual hardware PWM timing |
 | `#TRIG,<i>,<name>,<pin>,<freq>,ah=<0|1>` | Trigger configuration |
 | `#STROBE,<i>,<name>,<pin>,ah=<0|1>` | Exposure configuration |
 | `#TIME,...` | Timestamp sampling semantics |
+| `#READY` | Header completed and hardware PWM started |
 | `P,<seq>,<tick>` | PPS event |
-| `T,<seq>,<ch>,<level>,<tick>` | Trigger edge |
+| `T,<seq>,<ch>,<level>,<tick>` | PWM interrupt observation of a trigger edge |
 | `S,<seq>,<ch>,<level>,<tick>` | Exposure edge |
 | `Z,<seq>,<tick>,<raw NMEA>` | Complete NMEA sentence |
 | `#H`, `#Ht`, `#Hs` | Periodic aggregate and per-channel health |
 | `#HFINAL ...` | Final aggregate counters before STOP |
+| `#TRUNC,<group>,<last-rise-seq>,<stop-tick>` | STOP cut a high pulse; no synthetic falling edge is emitted |
 | `#IDLE,up=<ms>` | Idle heartbeat |
 
 Sequence numbers start at 1 per stream/channel each session and advance on software
@@ -220,10 +226,11 @@ bytes lost before sentence assembly. Data output drops rather than blocking when
 USB has no space; the event rings do not guarantee a host-stall recording buffer.
 
 Health fields include `pps`, `ppsdt` (last measured interval, not PPS age), `tod`,
-`todb`, `ppsdrops`, `todtrunc`, `tdrops`, `sdrops`, `host`, `skip`, and `stall`.
-Final health preserves loss counters before reset. The recorder rejects nonzero
-loss/skip/stall counters. STOP ends capture immediately, so an exposure still in
-progress can lack its closing edge; post-processing flags that observation.
+`todb`, `ppsdrops`, `todtrunc`, `tdrops`, `sdrops`, `host`, `pwmerr`, and `trunc`.
+Final health preserves counters before reset. The recorder rejects nonzero loss
+or PWM-error counters. A STOP cut is accepted only with valid `#TRUNC` records
+matching the final `trunc` count. STOP ends capture immediately, so an exposure
+still in progress can lack its closing edge; post-processing flags that observation.
 
 ## Post-processing
 

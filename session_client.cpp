@@ -4,15 +4,15 @@
 //     SensorSyncSession s;
 //     s.open("/dev/serial/by-id/usb-Teensyduino_...");   // by-id survives re-enumeration
 //     s.start("/data/logs/run_0007.log",                 // one file per run, counts from 0
-//             {{0, 25.0}, {1, 2.0}});                    // per-channel trigger Hz, decided in the field
+//             {{0, 25.0}, {2, 2.0}});                    // FX pair at 25 Hz, JAI pair at 2 Hz
 //     ... acquisition ...
 //     s.stop();                                          // board -> idle, counts cleared
 //
-// The freq list is optional; {ch, 0} switches a channel off, omitted channels keep
-// their config.h rate. It rides inside the START command ("START freq=0:25,1:2 <path>"),
-// so the board receives the rate request and session identity together. The board
-// echoes the EFFECTIVE rates in the "#TRIG" header; invalid
-// entries answer "#ERR,bad_freq,..." while keeping the old rate.
+// Protocol v2: channels 0/1 share FX, channels 2/3 share JAI. {ch, 0} disables
+// its whole pair; omitted groups retain their rate. Conflicting pair requests
+// fail before sending START. The wire command uses "freq=FX:25,JAI:2" and the
+// board echoes requested/actual rates in #GROUP and #TRIG. #ERR,bad_freq rejects
+// the whole request. #READY, after successful hardware start, acknowledges it.
 //
 // open() configures raw/no-echo, terminates any residual command, stops the board,
 // and verifies a fresh round trip followed by idle. Call it BEFORE camera arming.
@@ -27,12 +27,12 @@
 // an automatic board restart would destroy the original frame association.
 //
 // Protocol (newline-terminated, 115200 8N1 - do not change the baud):
-//   host -> board:  "START [freq=<ch>:<hz>,...] [path]" | "STOP" | "s" (status) | "h" (header)
-//   board -> host:  "#SESSION,START,<path>", header, P/T/S/Z data + "#H" health,
+//   host -> board:  "START [freq=FX:<hz>,JAI:<hz>] [path]" | "STOP" | "s" (status) | "h" (header)
+//   board -> host:  "#SESSION,START,<path>", v2 header, #READY, P/T/S/Z data + "#H" health,
 //                   "#HFINAL ...", "#SESSION,STOP,<path>"; "#IDLE,up=<ms>" while idle
 //
 // Build demo:  g++ -std=c++20 -O2 -pthread -DSESSION_CLIENT_DEMO session_client.cpp -o session_client
-// Run demo:    ./session_client /dev/ttyACM0 /tmp/run.log 5 25    (trig[0] at 25 Hz)
+// Run demo:    ./session_client /dev/ttyACM0 /tmp/run.log 5 25    (FX pair at 25 Hz)
 
 #include <atomic>
 #include <chrono>
@@ -54,6 +54,7 @@
 #include <termios.h>
 #include <unistd.h>
 #include "session_protocol.h"
+#include "session_rates.h"
 
 class SensorSyncSession {
 public:
@@ -78,8 +79,8 @@ public:
 	}
 
 	// begin a run: fresh counts from 0, stream captured to `path`.
-	// freqs: per-channel trigger rates {ch, hz} decided in the field (exposure
-	// time known -> rate computed); {ch, 0} = channel off; empty = keep defaults
+	// freqs: physical channel requests, collapsed into FX/JAI pairs on the wire.
+	// {ch, 0} disables its pair; empty retains both groups' previous rates.
 	bool start(const std::string &path, const std::vector<std::pair<int, double>> &freqs = {}) {
 		last_error_.clear();
 		if (running_) {
@@ -87,10 +88,8 @@ public:
 		}
 		if (path.size() > 223 || path.find_first_of("\r\n") != std::string::npos || path.find('\0') != std::string::npos)
 			return fail("invalid session path", EINVAL);
-		for (const auto &f : freqs) {
-			if (f.first < 0 || f.first >= 4 || !std::isfinite(f.second) || f.second < 0.0)
-				return fail("invalid trigger channel or frequency", EINVAL);
-		}
+		std::string rate_error;
+		if (!sensorsync::BuildFrequencySpec(freqs, freq_spec_, rate_error)) return fail(rate_error, EINVAL);
 		const int log_fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
 		if (log_fd < 0) return fail("create timing log", errno);
 		out_ = ::fdopen(log_fd, "wb");
@@ -100,12 +99,6 @@ public:
 			return fail("open timing log stream", err);
 		}
 		session_path_ = path;
-		freq_spec_.clear();
-		for (const auto &f : freqs) {
-			char item[48];
-			snprintf(item, sizeof(item), "%s%d:%g", freq_spec_.empty() ? "" : ",", f.first, f.second);
-			freq_spec_ += item;
-		}
 		{
 			std::lock_guard<std::mutex> lk(io_mtx_);
 			if (fd_ < 0) {
@@ -152,8 +145,10 @@ public:
 			protocol_error_ = true;
 			stop();
 			// The reader is joined: its first protocol failure is safe to inspect.
-			if (!protocol_detail_.empty()) return fail("START rejected: " + protocol_detail_, EPROTO);
-			return fail(missing_ack ? "START acknowledgement missing (see timing log)"
+			if (protocol_detail_.starts_with("#ERR"))
+				return fail("START rejected (freq=" + freq_spec_ + "): " + protocol_detail_, EPROTO);
+			if (!missing_ack && !protocol_detail_.empty()) return fail("START rejected: " + protocol_detail_, EPROTO);
+			return fail(missing_ack ? "START #READY acknowledgement missing (SensorSync protocol v2 required; see timing log)"
 			                        : "START serial/log integrity failure (see timing log)");
 		}
 		return true;
@@ -421,7 +416,7 @@ private:
 					protocol_error_ = true;
 					if (protocol_detail_.empty()) protocol_detail_ = std::string(line);
 				}
-				if (protocol_.starts > 0) start_ack_ = true;
+				if (protocol_.ready && !protocol_.failed) start_ack_ = true;
 				if (protocol_.stop_received) stop_ack_ = true;
 				line_len_ = 0;
 			} else if (line_len_ < sizeof(line_)) {
@@ -435,7 +430,7 @@ private:
 
 	std::string port_path_;
 	std::string session_path_;
-	std::string freq_spec_;	 // "0:25,1:2" - per-channel Hz for this run
+	std::string freq_spec_;	 // "FX:25,JAI:2" - group overrides for this run
 	int fd_ = -1;
 	int last_errno_ = 0;
 	std::string last_error_;
@@ -472,29 +467,21 @@ static bool writeStatus(const char *path, const char *value) {
 
 static bool parseFreqs(const char *arg, std::vector<std::pair<int, double>> &freqs) {
 	std::string spec = arg;
-	if (!spec.starts_with("freq=")) spec = "0:" + spec; // retain the original trig0_hz argument
-	else spec.erase(0, 5);
+	if (spec.starts_with("freq=")) spec.erase(0, 5);
+	else if (!spec.starts_with("FX:") && !spec.starts_with("JAI:")) spec = "FX:" + spec;
 	if (spec.empty()) return true;
-	std::size_t pos = 0;
-	while (pos < spec.size()) {
-		const auto end = spec.find(',', pos);
-		const std::string item = spec.substr(pos, end == std::string::npos ? end : end - pos);
-		char *colon = nullptr, *last = nullptr;
-		const long ch = strtol(item.c_str(), &colon, 10);
-		if (colon == item.c_str() || *colon != ':' || ch < 0 || ch >= 4) return false;
-		const double hz = strtod(colon + 1, &last);
-		if (last == colon + 1 || *last || !std::isfinite(hz) || hz < 0) return false;
-		freqs.emplace_back(static_cast<int>(ch), hz);
-		if (end == std::string::npos) return true;
-		pos = end + 1;
-		if (pos == spec.size()) return false;
+	trigger::Rates rates;
+	uint8_t fields = 0;
+	if (!trigger::parseRates(spec.c_str(), rates, &fields)) return false;
+	for (unsigned g = 0; g < trigger::GROUP_COUNT; ++g) {
+		if (fields & (1u << g)) freqs.emplace_back(static_cast<int>(2 * g), rates.hz[g]);
 	}
 	return true;
 }
 
 int main(int argc, char **argv) {
 	if (argc < 3 || argc > 6) {
-		fprintf(stderr, "usage: %s <port> <logfile> [seconds; 0=until signal] [trig0_hz|freq=ch:hz,...] [status_file]\n", argv[0]);
+		fprintf(stderr, "usage: %s <port> <logfile> [seconds; 0=until signal] [FX_hz|freq=FX:hz,JAI:hz] [status_file]\n", argv[0]);
 		return 2;
 	}
 	const char *status_path = argc > 5 ? argv[5] : nullptr;
@@ -507,7 +494,7 @@ int main(int argc, char **argv) {
 	const long secs = argc > 3 ? strtol(argv[3], &end, 10) : 5;
 	if (secs < 0 || secs > INT_MAX || (argc > 3 && (end == argv[3] || *end))) return fail("invalid duration");
 	std::vector<std::pair<int, double>> freqs;
-	if (argc > 4 && !parseFreqs(argv[4], freqs)) return fail("invalid frequency specification");
+	if (argc > 4 && !parseFreqs(argv[4], freqs)) return fail("invalid frequency specification; use FX:20-or-higher,JAI:1-to-10 (0 disables a group)");
 	signal(SIGINT, [](int) { g_interrupted = 1; });
 	signal(SIGTERM, [](int) { g_interrupted = 1; });
 	SensorSyncSession s;
