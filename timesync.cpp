@@ -9,7 +9,7 @@ namespace timesync {
 	static volatile uint64_t g_pps_tick[PPS_RING_SIZE];
 	static volatile uint32_t g_pps_seq_slot[PPS_RING_SIZE];
 	static volatile uint16_t g_pps_head = 0, g_pps_tail = 0;
-	static volatile uint32_t g_pps_seq = 0;	  // total edges seen (incl. dropped) = gap detector
+	static volatile uint32_t g_pps_seq = 0;	 // total edges seen (incl. dropped) = gap detector
 	static volatile uint32_t g_pps_drops = 0;
 
 	// last inter-PPS interval, ticks (health readout only)
@@ -108,12 +108,12 @@ namespace timesync {
 				continue;
 			}
 			if (g_nmea_len == 0) {
-				continue;  // no '$' yet
+				continue;				   // no '$' yet
 			}
 			if (c == '\r' || c == '\n') {  // terminator
 				const uint64_t arrive = timebase::now();
 				g_nmea[g_nmea_len] = 0;
-				if (g_nmea_overflow) {	// truncated: discard + count, don't emit garbage
+				if (g_nmea_overflow) {	   // truncated: discard + count, don't emit garbage
 					g_tod_trunc++;
 					g_nmea_len = 0;
 					g_nmea_overflow = false;

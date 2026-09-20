@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+
 #include "trigger_groups.h"
 
 // =============================================================================
@@ -54,19 +55,19 @@
 // Group defaults persist until overridden by START freq=FX:...,JAI:....
 // FX: >=20 Hz while representable; JAI: 1..10 Hz. Zero disables the whole group.
 // The camera's permissible frame rate must also be respected by the caller.
-static constexpr trigger::Rates TRIGGER_DEFAULT_RATES = {{50.0, 0.0}};
-static constexpr uint32_t GROUP_PULSE_US[trigger::GROUP_COUNT] = {50, 50};
+static constexpr trigger::Rates TRIGGER_DEFAULT_RATES = { { 50.0, 0.0 } };
+static constexpr uint32_t GROUP_PULSE_US[trigger::GROUP_COUNT] = { 50, 50 };
 
 struct TriggerCfg {
-    const char *name;
-    uint8_t pin;
-    bool active_high;
+	const char *name;
+	uint8_t pin;
+	bool active_high;
 };
 static constexpr TriggerCfg TRIG_CFG[] = {
-    {"FX10E-1", 33, true}, // SM0 B
-    {"FX10E-2",  4, true}, // SM0 A
-    {"JAI-1",   37, true}, // SM3 B
-    {"JAI-2",   36, true}  // SM3 A
+	{ "FX10E-1", 33, true },  // SM0 B
+	{ "FX10E-2", 4, true },	  // SM0 A
+	{ "JAI-1", 37, true },	  // SM3 B
+	{ "JAI-2", 36, true }	  // SM3 A
 };
 static constexpr uint8_t TRIG_MAX = sizeof(TRIG_CFG) / sizeof(TRIG_CFG[0]);
 
@@ -86,8 +87,8 @@ static constexpr StrobeCfg STROBE_CFG[] = {
 	// name  pin  active_high
 	{ "FX10E_EXP-1", 18, true },
 	{ "FX10E_EXP-2", 10, true },
-	{ "JAI_EXP-1", 14, true },
-	{ "JAI_EXP-2", 15, true }
+	{ "JAI_EXP-1", 14, false },	 // sinks line during exposure; bench log 2026-09-17
+	{ "JAI_EXP-2", 15, false }	 // same model as JAI-1; not yet bench-verified
 };
 static constexpr uint8_t STROBE_MAX = sizeof(STROBE_CFG) / sizeof(STROBE_CFG[0]);
 // The schematic's external pull-ups + non-inverting buffers drive HIGH on
@@ -110,13 +111,13 @@ static constexpr uint8_t STROBE_MAX = sizeof(STROBE_CFG) / sizeof(STROBE_CFG[0])
 // Arduino GPIO numbers, not U201 terminal numbers. Keep this order: leds::poll()
 // pairs these with PPS, RX bytes, FX trigger/exposure and JAI trigger/exposure.
 static constexpr uint8_t LED_PINS[] = {
-	2,  // D211 LED_PPS
-	3,  // D212 LED_RS232
-	6,  // D213 LED_TRIG_FX  (channels 0 + 1)
-	5,  // D214 LED_EXP_FX   (channels 0 + 1)
-	8,  // D215 LED_TRIG_JAI (channels 2 + 3)
-	7   // D216 LED_EXP_JAI  (channels 2 + 3)
+	2,					// D211 LED_PPS
+	3,					// D212 LED_RS232
+	6,					// D213 LED_TRIG_FX  (channels 0 + 1)
+	5,					// D214 LED_EXP_FX   (channels 0 + 1)
+	8,					// D215 LED_TRIG_JAI (channels 2 + 3)
+	7					// D216 LED_EXP_JAI  (channels 2 + 3)
 };
 static constexpr uint8_t LED_MAX = sizeof(LED_PINS) / sizeof(LED_PINS[0]);
-#define LED_HOLD_MS 10  // retriggerable visible activity indication, serviced in loop()
+#define LED_HOLD_MS 10	// retriggerable visible activity indication, serviced in loop()
 // D111 (+12V), D112 (+5V), D113 (+3V3) are wired to the rails; no GPIO control.

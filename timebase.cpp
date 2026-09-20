@@ -15,7 +15,7 @@ namespace timebase {
 	// GPT1 ISR: extend the free-running time ruler
 	static void gpt1_isr() {
 		uint32_t sr = GPT1_SR;
-		GPT1_SR = sr;				// write-1-clear
+		GPT1_SR = sr;  // write-1-clear
 
 		if (sr & SS_GPT_SR_ROV) {
 			g_rollover += 0x100000000ULL;

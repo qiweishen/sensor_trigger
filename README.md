@@ -19,14 +19,14 @@ Teensy USB -> session_client -> raw log -> postprocess.py -> frames.csv
 Refer to [the schematic](resource/SCH_Schematic1_2026-08-26.pdf). Use the Arduino
 GPIO numbers below, not the schematic symbol's physical terminal numbers.
 
-| Channel / signal | Trigger GPIO | Exposure GPIO | Default trigger rate |
-|---|---:|---:|---:|
-| 0: FX10E-1 | 33 | 18 | 50 Hz |
-| 1: FX10E-2 | 4 | 10 | 50 Hz |
-| 2: JAI-1 | 37 | 14 | off |
-| 3: JAI-2 | 36 | 15 | off |
-| PPS | input 19 | — | rising edge |
-| NMEA | Serial1 RX: 0; TX: 1 | — | 115200, 8N1 |
+| Channel / signal |         Trigger GPIO | Exposure GPIO | Default trigger rate |
+|------------------|---------------------:|--------------:|---------------------:|
+| 0: FX10E-1       |                   33 |            18 |                50 Hz |
+| 1: FX10E-2       |                    4 |            10 |                50 Hz |
+| 2: JAI-1         |                   37 |            14 |                  off |
+| 3: JAI-2         |                   36 |            15 |                  off |
+| PPS              |             input 19 |             — |          rising edge |
+| NMEA             | Serial1 RX: 0; TX: 1 |             — |          115200, 8N1 |
 
 The FX pair (channels 0/1) defaults to 50 Hz; the JAI pair (channels 2/3) defaults
 to disabled. Each pair shares one hardware PWM rate and cannot be enabled or
@@ -65,12 +65,12 @@ park the outputs and increment `pwmerr`; these fail the host recording.
 
 Current log timestamps mean:
 
-| Stream | Timestamp meaning |
-|---|---|
-| `P` | GPIO PPS ISR sample |
-| `T` | GPT sample in the PWM interrupt handler; both members of a pair share it |
-| `S` | GPIO exposure ISR sample |
-| `Z` | Time when the NMEA terminator is read by the main loop |
+| Stream | Timestamp meaning                                                        |
+|--------|--------------------------------------------------------------------------|
+| `P`    | GPIO PPS ISR sample                                                      |
+| `T`    | GPT sample in the PWM interrupt handler; both members of a pair share it |
+| `S`    | GPIO exposure ISR sample                                                 |
+| `Z`    | Time when the NMEA terminator is read by the main loop                   |
 
 The 13.3 ns tick is **resolution, not guaranteed accuracy**. ISR latency and external circuitry contribute
 measurement error. PPS fitting corrects the clock scale/drift; it cannot remove
@@ -187,12 +187,12 @@ USB CDC commands are newline-terminated; 115200 is a nominal USB baud setting.
 The board boots idle. `config.h` contains pins, defaults, pulse widths and
 interrupt priorities.
 
-| Command | Action |
-|---|---|
-| `START [freq=FX:HZ,JAI:HZ] [path]` | Validate rates, close any old session, emit header, start PWM and acknowledge with `#READY` |
-| `STOP` | Disable outputs/capture, drain queued events, emit final health and STOP |
-| `s` or `STATUS` | Health while running; IDLE otherwise |
-| `h` or `HEADER` | Reprint the current channel and timebase configuration |
+| Command                            | Action                                                                                                              |
+|------------------------------------|---------------------------------------------------------------------------------------------------------------------|
+| `START [freq=FX:HZ,JAI:HZ] [path]` | Validate rates, close any old session, emit header, start PWM and acknowledge with `#READY`                         |
+| `STOP`                             | Park PWM outputs, retain exposure GPIO capture for a bounded 1000 ms tail, drain events, emit final health and STOP |
+| `s` or `STATUS`                    | Health while running; IDLE otherwise                                                                                |
+| `h` or `HEADER`                    | Reprint the current channel and timebase configuration                                                              |
 
 A frequency of 0 disables a whole pair. Enabled FX rates must be finite and at
 least 20 Hz; JAI rates must be within 1–10 Hz. The firmware also checks whether
@@ -202,23 +202,23 @@ groups retain their previous rate until reboot. Numeric wire keys such as
 the existing session or rates. Check `#GROUP` and `#TRIG` for the quantized rate.
 The path is echo-only; it does not make the board write to the host filesystem.
 
-| Record | Meaning |
-|---|---|
-| `#SESSION,START,<path>` / `#SESSION,STOP,<path>` | Session boundaries |
-| `#LOG,SensorSync-logger,2,tick_hz=<f>` | Protocol version and nominal timebase frequency |
-| `#GROUP,<name>,requested=...,actual=...,pulse_us=...,clock_hz=...,div=...,period=...,width=...` | Requested and actual hardware PWM timing |
-| `#TRIG,<i>,<name>,<pin>,<freq>,ah=<0|1>` | Trigger configuration |
-| `#STROBE,<i>,<name>,<pin>,ah=<0|1>` | Exposure configuration |
-| `#TIME,...` | Timestamp sampling semantics |
-| `#READY` | Header completed and hardware PWM started |
-| `P,<seq>,<tick>` | PPS event |
-| `T,<seq>,<ch>,<level>,<tick>` | PWM interrupt observation of a trigger edge |
-| `S,<seq>,<ch>,<level>,<tick>` | Exposure edge |
-| `Z,<seq>,<tick>,<raw NMEA>` | Complete NMEA sentence |
-| `#H`, `#Ht`, `#Hs` | Periodic aggregate and per-channel health |
-| `#HFINAL ...` | Final aggregate counters before STOP |
-| `#TRUNC,<group>,<last-rise-seq>,<stop-tick>` | STOP cut a high pulse; no synthetic falling edge is emitted |
-| `#IDLE,up=<ms>` | Idle heartbeat |
+| Record                                                                                          | Meaning                                                     |
+|-------------------------------------------------------------------------------------------------|-------------------------------------------------------------|
+| `#SESSION,START,<path>` / `#SESSION,STOP,<path>`                                                | Session boundaries                                          |
+| `#LOG,SensorSync-logger,2,tick_hz=<f>`                                                          | Protocol version and nominal timebase frequency             |
+| `#GROUP,<name>,requested=...,actual=...,pulse_us=...,clock_hz=...,div=...,period=...,width=...` | Requested and actual hardware PWM timing                    |
+| `#TRIG,<i>,<name>,<pin>,<freq>,ah=<0                                                            | 1>`                                                         | Trigger configuration |
+| `#STROBE,<i>,<name>,<pin>,ah=<0                                                                 | 1>`                                                         | Exposure configuration |
+| `#TIME,...`                                                                                     | Timestamp sampling semantics                                |
+| `#READY`                                                                                        | Header completed and hardware PWM started                   |
+| `P,<seq>,<tick>`                                                                                | PPS event                                                   |
+| `T,<seq>,<ch>,<level>,<tick>`                                                                   | PWM interrupt observation of a trigger edge                 |
+| `S,<seq>,<ch>,<level>,<tick>`                                                                   | Exposure edge                                               |
+| `Z,<seq>,<tick>,<raw NMEA>`                                                                     | Complete NMEA sentence                                      |
+| `#H`, `#Ht`, `#Hs`                                                                              | Periodic aggregate and per-channel health                   |
+| `#HFINAL ...`                                                                                   | Final aggregate counters before STOP                        |
+| `#TRUNC,<group>,<last-rise-seq>,<stop-tick>`                                                    | STOP cut a high pulse; no synthetic falling edge is emitted |
+| `#IDLE,up=<ms>`                                                                                 | Idle heartbeat                                              |
 
 Sequence numbers start at 1 per stream/channel each session and advance on software
 queue/output drops. They do not count physical edges missed before the GPIO ISR or
@@ -229,7 +229,13 @@ Health fields include `pps`, `ppsdt` (last measured interval, not PPS age), `tod
 `todb`, `ppsdrops`, `todtrunc`, `tdrops`, `sdrops`, `host`, `pwmerr`, and `trunc`.
 Final health preserves counters before reset. The recorder rejects nonzero loss
 or PWM-error counters. A STOP cut is accepted only with valid `#TRUNC` records
-matching the final `trunc` count. STOP ends capture immediately, so an exposure
+matching the final `trunc` count. STOP retains GPIO exposure capture for 1000 ms,
+including delayed exposure starts, while PWM is already disabled. An observed
+exposure still active at the deadline emits `#ERR,exposure_tail_timeout,mask=...`;
+the host marks that timing session incomplete. This budget is not a guarantee
+for arbitrary camera delay/exposure settings. The host also checks actual
+trigger/exposure/frame counts and complete exposure pairs. Older firmware ends
+capture immediately, so an exposure
 still in progress can lack its closing edge; post-processing flags that observation.
 
 ## Post-processing
@@ -243,17 +249,17 @@ python3 postprocess.py "$LOG" -o "${LOG%.log}.csv" --tod-scale utc --convention 
 # Add --gps --leap N for GPS output, replacing N with the verified GPS-UTC offset.
 ```
 
-| Option | Meaning |
-|---|---|
-| `--tod-scale utc|gps` | Required: receiver calendar-field time scale |
-| `--convention preceding|following` | Required: which PPS the received label describes |
-| `--gps` | Output GPS seconds instead of UTC/Unix seconds |
-| `--leap N` | Explicit GPS−UTC offset; required for GPS input or output |
-| `--window S` | Fit window, default 10 s |
-| `--session N` | Required selection if a log contains multiple sessions |
-| `--link A:B,...` | Strobe-to-trigger map; default same channel index |
-| `--edges FILE` | Optional per-edge CSV |
-| `-o FILE` | New per-frame CSV, default `frames.csv`; existing files are not overwritten |
+| Option                  | Meaning                                                                     |
+|-------------------------|-----------------------------------------------------------------------------|
+| `--tod-scale utc        | gps`                                                                        | Required: receiver calendar-field time scale |
+| `--convention preceding | following`                                                                  | Required: which PPS the received label describes |
+| `--gps`                 | Output GPS seconds instead of UTC/Unix seconds                              |
+| `--leap N`              | Explicit GPS−UTC offset; required for GPS input or output                   |
+| `--window S`            | Fit window, default 10 s                                                    |
+| `--session N`           | Required selection if a log contains multiple sessions                      |
+| `--link A:B,...`        | Strobe-to-trigger map; default same channel index                           |
+| `--edges FILE`          | Optional per-edge CSV                                                       |
+| `-o FILE`               | New per-frame CSV, default `frames.csv`; existing files are not overwritten |
 
 The fit uses small numeric offsets to preserve timestamp precision. A centered
 result requires coverage of the full requested window, retained anchors before
@@ -271,14 +277,14 @@ anchor count, source sequences/ticks, flags, and the selected time-scale setting
 `dur_us` and latency use the same calibrated times as the timestamp columns.
 Duration is blank unless both exposure endpoints have valid fits.
 
-| Flag | Meaning |
-|---|---|
-| `0x01` | Incomplete time fit |
-| `0x02` | No matched trigger time, or its fit failed |
+| Flag   | Meaning                                          |
+|--------|--------------------------------------------------|
+| `0x01` | Incomplete time fit                              |
+| `0x02` | No matched trigger time, or its fit failed       |
 | `0x04` | Suspect exposure reconstruction near a lost edge |
-| `0x08` | Non-centered fit / incomplete window coverage |
-| `0x10` | Missing exposure end edge |
-| `0x40` | Log integrity incomplete or unverified |
+| `0x08` | Non-centered fit / incomplete window coverage    |
+| `0x10` | Missing exposure end edge                        |
+| `0x40` | Log integrity incomplete or unverified           |
 
 Fit RMS describes residuals; it is not an absolute timing-accuracy guarantee.
 

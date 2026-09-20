@@ -35,24 +35,24 @@
 // Run demo:    ./session_client /dev/ttyACM0 /tmp/run.log 5 25    (FX pair at 25 Hz)
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
-#include <cmath>
 #include <climits>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <mutex>
+#include <poll.h>
 #include <string>
+#include <termios.h>
 #include <thread>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
-#include <cerrno>
-#include <fcntl.h>
-#include <poll.h>
-#include <termios.h>
-#include <unistd.h>
 #include "session_protocol.h"
 #include "session_rates.h"
 
@@ -60,7 +60,8 @@ class SensorSyncSession {
 public:
 	~SensorSyncSession() {
 		stop();
-		if (out_) ::fclose(out_); // also covers an allocation exception during start()
+		if (out_)
+			::fclose(out_);	 // also covers an allocation exception during start()
 		std::lock_guard<std::mutex> lk(io_mtx_);
 		closePortLocked();
 	}
@@ -70,7 +71,8 @@ public:
 	// prefer a /dev/serial/by-id/ path: it survives USB re-enumeration.
 	bool open(const char *port) {
 		std::lock_guard<std::mutex> lk(io_mtx_);
-		if (running_) return fail("cannot reopen a running session", EBUSY);
+		if (running_)
+			return fail("cannot reopen a running session", EBUSY);
 		startup_log_.clear();
 		last_error_.clear();
 		port_path_ = port;
@@ -89,9 +91,11 @@ public:
 		if (path.size() > 223 || path.find_first_of("\r\n") != std::string::npos || path.find('\0') != std::string::npos)
 			return fail("invalid session path", EINVAL);
 		std::string rate_error;
-		if (!sensorsync::BuildFrequencySpec(freqs, freq_spec_, rate_error)) return fail(rate_error, EINVAL);
+		if (!sensorsync::BuildFrequencySpec(freqs, freq_spec_, rate_error))
+			return fail(rate_error, EINVAL);
 		const int log_fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
-		if (log_fd < 0) return fail("create timing log", errno);
+		if (log_fd < 0)
+			return fail("create timing log", errno);
 		out_ = ::fdopen(log_fd, "wb");
 		if (!out_) {
 			const int err = errno;
@@ -115,7 +119,7 @@ public:
 			}
 			if (!sendStartLocked()) {
 				const int err = errno;
-				writeCommandLocked("STOP\n"); // best effort after an ambiguous/partial START write
+				writeCommandLocked("STOP\n");  // best effort after an ambiguous/partial START write
 				::fclose(out_);
 				out_ = nullptr;
 				return fail("send START command", err);
@@ -133,7 +137,7 @@ public:
 		try {
 			reader_ = std::thread(&SensorSyncSession::readerLoop, this);
 		} catch (...) {
-			stop(); // even a thread-creation failure must stop pulses already requested
+			stop();	 // even a thread-creation failure must stop pulses already requested
 			return fail("create serial reader thread");
 		}
 		const auto deadline = Clock::now() + std::chrono::seconds(3);
@@ -147,9 +151,10 @@ public:
 			// The reader is joined: its first protocol failure is safe to inspect.
 			if (protocol_detail_.starts_with("#ERR"))
 				return fail("START rejected (freq=" + freq_spec_ + "): " + protocol_detail_, EPROTO);
-			if (!missing_ack && !protocol_detail_.empty()) return fail("START rejected: " + protocol_detail_, EPROTO);
+			if (!missing_ack && !protocol_detail_.empty())
+				return fail("START rejected: " + protocol_detail_, EPROTO);
 			return fail(missing_ack ? "START #READY acknowledgement missing (SensorSync protocol v2 required; see timing log)"
-			                        : "START serial/log integrity failure (see timing log)");
+									: "START serial/log integrity failure (see timing log)");
 		}
 		return true;
 	}
@@ -164,36 +169,36 @@ public:
 			std::lock_guard<std::mutex> lk(io_mtx_);
 			if (fd_ >= 0) {
 				const char *cmd = "STOP\n";
-				if (!writeCommandLocked(cmd)) protocol_error_ = true;
+				if (!writeCommandLocked(cmd))
+					protocol_error_ = true;
 			} else {
 				protocol_error_ = true;
 			}
 		}
 		// let "#SESSION,STOP" land in the file before tearing the reader down
-		const auto deadline = Clock::now() + std::chrono::seconds(3); // firmware drains + emits final health before STOP
+		const auto deadline = Clock::now() + std::chrono::seconds(5);  // exposure tail + final queue/health drain
 		while (!stop_ack_ && !write_error_ && Clock::now() < deadline) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		}
-		if (!stop_ack_) protocol_error_ = true;
+		if (!stop_ack_)
+			protocol_error_ = true;
 		running_ = false;
 		if (reader_.joinable()) {
 			reader_.join();
 		}
 		if (out_) {
-			if (::fflush(out_) != 0 || ::fdatasync(::fileno(out_)) != 0) write_error_ = true;
-			if (::fclose(out_) != 0) write_error_ = true;
+			if (::fflush(out_) != 0 || ::fdatasync(::fileno(out_)) != 0)
+				write_error_ = true;
+			if (::fclose(out_) != 0)
+				write_error_ = true;
 			out_ = nullptr;
 		}
 	}
 
-	bool ok() const {
-		return !write_error_ && !protocol_error_;
-	}
+	bool ok() const { return !write_error_ && !protocol_error_; }
 
 	// Diagnostics for failed open()/start(); inspect after the call returns.
-	int lastErrno() const {
-		return last_errno_;
-	}
+	int lastErrno() const { return last_errno_; }
 	const std::string &lastError() const { return last_error_; }
 	// Raw synchronization replies, bounded to 64 KiB. Retain in the application's
 	// diagnostic log, not in the subsequent timing data file.
@@ -205,7 +210,8 @@ private:
 	bool fail(std::string_view reason, int err = 0) {
 		last_errno_ = err;
 		last_error_ = reason;
-		if (err) last_error_ += ": " + std::string(std::strerror(err));
+		if (err)
+			last_error_ += ": " + std::string(std::strerror(err));
 		return false;
 	}
 
@@ -237,7 +243,7 @@ private:
 		cfsetospeed(&tio, B115200);
 		tio.c_cflag |= (CLOCAL | CREAD);
 		tio.c_cc[VMIN] = 0;
-		tio.c_cc[VTIME] = 1;	 // 0.1 s read timeout -> reader can poll running_
+		tio.c_cc[VTIME] = 1;  // 0.1 s read timeout -> reader can poll running_
 		// Disable echo BEFORE clearing queued echo bytes or sending anything.
 		// Keep O_NONBLOCK during startup so reads and writes obey its deadline.
 		if (tcsetattr(fd_, TCSANOW, &tio) != 0) {
@@ -261,28 +267,31 @@ private:
 
 	bool waitStartupIoLocked(short events, Clock::time_point deadline) {
 		while (Clock::now() < deadline) {
-			pollfd pfd{fd_, events, 0};
+			pollfd pfd{ fd_, events, 0 };
 			const int ready = ::poll(&pfd, 1, 100);
 			if (ready < 0) {
-				if (errno == EINTR) continue;
+				if (errno == EINTR)
+					continue;
 				return fail("startup serial poll", errno);
 			}
 			if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
 				return fail("serial port lost during startup synchronization", EIO);
-			if (pfd.revents & events) return true;
+			if (pfd.revents & events)
+				return true;
 		}
 		return fail("startup synchronization timed out waiting for barrier/idle", ETIMEDOUT);
 	}
 
 	bool synchronizeLocked() {
 		// This clears host queues, not the firmware's persistent cmd[]/cmdlen.
-		if (tcflush(fd_, TCIOFLUSH) != 0) return fail("flush startup serial queues", errno);
-		static std::atomic<unsigned long long> sequence{0};
+		if (tcflush(fd_, TCIOFLUSH) != 0)
+			return fail("flush startup serial queues", errno);
+		static std::atomic<unsigned long long> sequence{ 0 };
 		const std::string marker = "__SENSORSYNC_SYNC_" + std::to_string(::getpid()) + "_" +
-			std::to_string(Clock::now().time_since_epoch().count()) + "_" + std::to_string(++sequence);
+								   std::to_string(Clock::now().time_since_epoch().count()) + "_" + std::to_string(++sequence);
 		const std::string barrier_reply = "#ERR,unknown_command," + marker;
 		const std::string completion_reply = barrier_reply + "_DONE";
-		SensorSyncStartupProtocol startup{barrier_reply, completion_reply};
+		SensorSyncStartupProtocol startup{ barrier_reply, completion_reply };
 		// Terminate the residual line, then stop any old session. The fresh marker
 		// proves earlier commands/replies were processed; status must report idle.
 		// A second marker confirms the status command was consumed, even if an
@@ -291,20 +300,26 @@ private:
 		const auto deadline = Clock::now() + std::chrono::seconds(3);
 		std::size_t sent = 0;
 		while (sent < commands.size()) {
-			if (!waitStartupIoLocked(POLLOUT, deadline)) return false;
+			if (!waitStartupIoLocked(POLLOUT, deadline))
+				return false;
 			const ssize_t n = ::write(fd_, commands.data() + sent, commands.size() - sent);
-			if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
-			if (n <= 0) return fail("write startup synchronization commands", n < 0 ? errno : EIO);
+			if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+				continue;
+			if (n <= 0)
+				return fail("write startup synchronization commands", n < 0 ? errno : EIO);
 			sent += static_cast<std::size_t>(n);
 		}
 
 		char buf[512], line[2048];
 		std::size_t line_len = 0;
 		for (;;) {
-			if (!waitStartupIoLocked(POLLIN, deadline)) return false;
+			if (!waitStartupIoLocked(POLLIN, deadline))
+				return false;
 			const ssize_t n = ::read(fd_, buf, sizeof(buf));
-			if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
-			if (n <= 0) return fail("read startup synchronization replies", n < 0 ? errno : EIO);
+			if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+				continue;
+			if (n <= 0)
+				return fail("read startup synchronization replies", n < 0 ? errno : EIO);
 			const auto size = static_cast<std::size_t>(n);
 			if (startup_log_.size() + size > 64 * 1024)
 				return fail("startup synchronization exceeded 64 KiB diagnostic limit", EOVERFLOW);
@@ -314,9 +329,11 @@ private:
 					// Wait for LF even when CRLF is split across reads: a leftover
 					// LF must not become the first byte of the capture log.
 					std::string_view reply(line, line_len);
-					if (reply.ends_with('\r')) reply.remove_suffix(1);
+					if (reply.ends_with('\r'))
+						reply.remove_suffix(1);
 					startup.observe(reply);
-					if (startup.failed) return fail("unexpected reply after startup barrier: " + std::string(reply), EPROTO);
+					if (startup.failed)
+						return fail("unexpected reply after startup barrier: " + std::string(reply), EPROTO);
 					line_len = 0;
 				} else if (line_len < sizeof(line)) {
 					line[line_len++] = buf[i];
@@ -325,7 +342,8 @@ private:
 				}
 			}
 			// Process the whole read, including any fragmented trailing reply.
-			if (startup.completed && line_len == 0) return true;
+			if (startup.completed && line_len == 0)
+				return true;
 		}
 	}
 
@@ -336,17 +354,28 @@ private:
 			cmd += "freq=" + freq_spec_ + " ";
 		}
 		cmd += session_path_ + "\n";
-		if (cmd.size() > 255) { errno = EMSGSIZE; return false; }
+		if (cmd.size() > 255) {
+			errno = EMSGSIZE;
+			return false;
+		}
 		return writeCommandLocked(cmd);
 	}
 
 	bool writeCommandLocked(const std::string &cmd) {
-		if (fd_ < 0) { errno = EBADF; return false; }
+		if (fd_ < 0) {
+			errno = EBADF;
+			return false;
+		}
 		std::size_t sent = 0;
 		while (sent < cmd.size()) {
 			const ssize_t n = ::write(fd_, cmd.data() + sent, cmd.size() - sent);
-			if (n < 0 && errno == EINTR) continue;
-			if (n <= 0) { if (n == 0) errno = EIO; return false; }
+			if (n < 0 && errno == EINTR)
+				continue;
+			if (n <= 0) {
+				if (n == 0)
+					errno = EIO;
+				return false;
+			}
 			sent += static_cast<std::size_t>(n);
 		}
 		return true;
@@ -364,14 +393,13 @@ private:
 			}
 			if (fd < 0) {
 				protocol_error_ = true;
-				break; // a new clock epoch must not be silently joined to this recording
+				break;	// a new clock epoch must not be silently joined to this recording
 			}
 			const auto t0 = Clock::now();
 			const ssize_t n = ::read(fd, buf, sizeof(buf));
 			if (n > 0) {
 				fast_zero = 0;
-				if (::fwrite(buf, 1, static_cast<std::size_t>(n), out_) != static_cast<std::size_t>(n) ||
-				    ::fflush(out_) != 0) {
+				if (::fwrite(buf, 1, static_cast<std::size_t>(n), out_) != static_cast<std::size_t>(n) || ::fflush(out_) != 0) {
 					write_error_ = true;
 					break;
 				}
@@ -384,7 +412,7 @@ private:
 				std::lock_guard<std::mutex> lk(io_mtx_);
 				closePortLocked();
 				protocol_error_ = true;
-			} else {  // n == 0: VTIME timeout - or EOF, which returns instantly
+			} else {						  // n == 0: VTIME timeout - or EOF, which returns instantly
 				if (Clock::now() - t0 < std::chrono::milliseconds(20)) {
 					if (++fast_zero >= 20) {  // sustained instant EOF = dead port
 						fast_zero = 0;
@@ -406,24 +434,29 @@ private:
 			if (c == '\n' || c == '\r') {
 				const std::string_view line(line_, line_len_);
 				bool bad_line = false;
-				for (const std::string_view prefix : {"#SESSION,START,", "#SESSION,STOP,"}) {
-					if (line.starts_with(prefix) && line.substr(prefix.size()) != session_path_) bad_line = true;
+				for (const std::string_view prefix: { "#SESSION,START,", "#SESSION,STOP," }) {
+					if (line.starts_with(prefix) && line.substr(prefix.size()) != session_path_)
+						bad_line = true;
 				}
 				const bool already_failed = protocol_.failed;
 				protocol_.observe(line, stopping_.load());
 				bad_line = bad_line || (!already_failed && protocol_.failed);
 				if (bad_line) {
 					protocol_error_ = true;
-					if (protocol_detail_.empty()) protocol_detail_ = std::string(line);
+					if (protocol_detail_.empty())
+						protocol_detail_ = std::string(line);
 				}
-				if (protocol_.ready && !protocol_.failed) start_ack_ = true;
-				if (protocol_.stop_received) stop_ack_ = true;
+				if (protocol_.ready && !protocol_.failed)
+					start_ack_ = true;
+				if (protocol_.stop_received)
+					stop_ack_ = true;
 				line_len_ = 0;
 			} else if (line_len_ < sizeof(line_)) {
 				line_[line_len_++] = c;
 			} else {
-				protocol_error_ = true; // preserve bytes in the log, but never accept a truncated control record
-				if (protocol_detail_.empty()) protocol_detail_ = "control record exceeds 2048 bytes";
+				protocol_error_ = true;	 // preserve bytes in the log, but never accept a truncated control record
+				if (protocol_detail_.empty())
+					protocol_detail_ = "control record exceeds 2048 bytes";
 			}
 		}
 	}
@@ -435,17 +468,17 @@ private:
 	int last_errno_ = 0;
 	std::string last_error_;
 	std::string startup_log_;
-	std::string protocol_detail_; // reader-thread-only until stop() joins it
+	std::string protocol_detail_;  // reader-thread-only until stop() joins it
 	std::FILE *out_ = nullptr;
 	std::thread reader_;
-	std::mutex io_mtx_;	 // guards fd_ open/close/write
+	std::mutex io_mtx_;			   // guards fd_ open/close/write
 	std::atomic<bool> running_{ false };
 	std::atomic<bool> stopping_{ false };
 	std::atomic<bool> write_error_{ false };
 	std::atomic<bool> protocol_error_{ false };
 	std::atomic<bool> start_ack_{ false };
 	std::atomic<bool> stop_ack_{ false };
-	SensorSyncProtocol protocol_; // reader-thread-only; state mirrored through atomics above
+	SensorSyncProtocol protocol_;  // reader-thread-only; state mirrored through atomics above
 	char line_[2048];
 	size_t line_len_ = 0;
 };
@@ -456,10 +489,12 @@ private:
 static volatile std::sig_atomic_t g_interrupted = 0;
 
 static bool writeStatus(const char *path, const char *value) {
-	if (!path) return true;
+	if (!path)
+		return true;
 	const std::string tmp = std::string(path) + ".tmp";
 	FILE *f = ::fopen(tmp.c_str(), "w");
-	if (!f) return false;
+	if (!f)
+		return false;
 	const bool written = ::fprintf(f, "%s\n", value) > 0;
 	const bool closed = ::fclose(f) == 0;
 	return written && closed && ::rename(tmp.c_str(), path) == 0;
@@ -467,14 +502,19 @@ static bool writeStatus(const char *path, const char *value) {
 
 static bool parseFreqs(const char *arg, std::vector<std::pair<int, double>> &freqs) {
 	std::string spec = arg;
-	if (spec.starts_with("freq=")) spec.erase(0, 5);
-	else if (!spec.starts_with("FX:") && !spec.starts_with("JAI:")) spec = "FX:" + spec;
-	if (spec.empty()) return true;
+	if (spec.starts_with("freq="))
+		spec.erase(0, 5);
+	else if (!spec.starts_with("FX:") && !spec.starts_with("JAI:"))
+		spec = "FX:" + spec;
+	if (spec.empty())
+		return true;
 	trigger::Rates rates;
 	uint8_t fields = 0;
-	if (!trigger::parseRates(spec.c_str(), rates, &fields)) return false;
+	if (!trigger::parseRates(spec.c_str(), rates, &fields))
+		return false;
 	for (unsigned g = 0; g < trigger::GROUP_COUNT; ++g) {
-		if (fields & (1u << g)) freqs.emplace_back(static_cast<int>(2 * g), rates.hz[g]);
+		if (fields & (1u << g))
+			freqs.emplace_back(static_cast<int>(2 * g), rates.hz[g]);
 	}
 	return true;
 }
@@ -492,9 +532,11 @@ int main(int argc, char **argv) {
 	};
 	char *end = nullptr;
 	const long secs = argc > 3 ? strtol(argv[3], &end, 10) : 5;
-	if (secs < 0 || secs > INT_MAX || (argc > 3 && (end == argv[3] || *end))) return fail("invalid duration");
+	if (secs < 0 || secs > INT_MAX || (argc > 3 && (end == argv[3] || *end)))
+		return fail("invalid duration");
 	std::vector<std::pair<int, double>> freqs;
-	if (argc > 4 && !parseFreqs(argv[4], freqs)) return fail("invalid frequency specification; use FX:20-or-higher,JAI:1-to-10 (0 disables a group)");
+	if (argc > 4 && !parseFreqs(argv[4], freqs))
+		return fail("invalid frequency specification; use FX:20-or-higher,JAI:1-to-10 (0 disables a group)");
 	signal(SIGINT, [](int) { g_interrupted = 1; });
 	signal(SIGTERM, [](int) { g_interrupted = 1; });
 	SensorSyncSession s;
@@ -516,13 +558,14 @@ int main(int argc, char **argv) {
 		return fail("cannot publish recorder status");
 	}
 	const auto start = std::chrono::steady_clock::now();
-	while (!g_interrupted && s.ok() &&
-	       (secs == 0 || std::chrono::steady_clock::now() - start < std::chrono::seconds(secs))) {
+	while (!g_interrupted && s.ok() && (secs == 0 || std::chrono::steady_clock::now() - start < std::chrono::seconds(secs))) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(20));
 	}
 	s.stop();
-	if (!s.ok()) return fail("recording failed: port, protocol, reported event loss, or log write error");
-	if (!writeStatus(status_path, "DONE")) return fail("cannot publish final recorder status");
+	if (!s.ok())
+		return fail("recording failed: port, protocol, reported event loss, or log write error");
+	if (!writeStatus(status_path, "DONE"))
+		return fail("cannot publish final recorder status");
 	fprintf(stderr, "done.\n");
 	return 0;
 }

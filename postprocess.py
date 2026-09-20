@@ -13,8 +13,12 @@ The board logs only raw ticks + raw NMEA (it computes no GNSS time). This script
 
 Only dependency: numpy.
 
-Usage requires explicitly verified --tod-scale (utc/gps) and --convention
-(preceding/following). GPS conversion also requires the applicable --leap.
+NMEA ToD is UTC. --convention (preceding/following) must be operator-verified; it is
+required whenever the log holds PPS + ToD. Every CSV time carries UTC/Unix and GPS
+seconds sharing one ns column: GPS = UTC + leap - GPS epoch, --leap defaults to 18.
+No usable PPS<->ToD anchors (indoor test): free-run fallback -- first trigger edge =
+GPS epoch (1980-01-06, GPS-UTC = 0), nominal tick rate, no drift correction, flag 0x20.
+--strobe-ah overrides a header polarity (ah=) logged before the camera was verified.
 Output CSV rows describe strobe observations; they are not camera BlockIDs.
 T ticks use the #TIME source: PWM ISR samples in version 2, GPIO write samples or
 scheduled compares in older logs. S and P are GPIO ISR samples. Fits do not remove
@@ -30,6 +34,8 @@ from dataclasses import dataclass, field
 import numpy as np
 
 GPS_EPOCH_UNIX = 315964800  # 1980-01-06 00:00:00 UTC, in Unix seconds
+GPS_UTC_LEAP_S = 18  # GPS-UTC since 2017-01-01; --leap overrides
+MIN_ANCHORS = 4  # fewer PPS<->ToD anchors -> free-run fallback
 
 
 # ---------------------------------------------------------------------------
@@ -114,15 +120,15 @@ def parse_nmea_unix(s):
 @dataclass
 class Log:
     tick_hz: float = 75_000_000.0
-    trig_cfg: dict = field(default_factory=dict)    # ch -> {name, pin, freq, active_high}
+    trig_cfg: dict = field(default_factory=dict)  # ch -> {name, pin, freq, active_high}
     strobe_cfg: dict = field(default_factory=dict)  # ch -> {name, pin, active_high}
-    pps: list = field(default_factory=list)         # (seq, tick)
-    trig: dict = field(default_factory=dict)        # ch -> [(seq, level, tick)]
-    strobe: dict = field(default_factory=dict)      # ch -> [(seq, level, tick)]
-    tod: list = field(default_factory=list)         # (seq, tick, unix_sec) valid only
+    pps: list = field(default_factory=list)  # (seq, tick)
+    trig: dict = field(default_factory=dict)  # ch -> [(seq, level, tick)]
+    strobe: dict = field(default_factory=dict)  # ch -> [(seq, level, tick)]
+    tod: list = field(default_factory=list)  # (seq, tick, unix_sec) valid only
     tod_bad: int = 0
-    tod_seq: list = field(default_factory=list)     # every Z seq (good or bad NMEA)
-    from_marker: bool = False                       # began at #SESSION,START
+    tod_seq: list = field(default_factory=list)  # every Z seq (good or bad NMEA)
+    from_marker: bool = False  # began at #SESSION,START
     session_path: str = ''
     first_line: int = 1
     last_line: int = 0
@@ -186,7 +192,8 @@ def parse_log(path):
                         final = line.startswith('#HFINAL ')
                         cur.final_health |= final
                         fields = dict(tok.split('=', 1) for tok in line.split() if '=' in tok)
-                        for key in ('ppsdrops', 'todtrunc', 'tdrops', 'sdrops', 'host') + (('pwmerr',) if cur.version >= 2 else ('skip', 'stall')):
+                        for key in ('ppsdrops', 'todtrunc', 'tdrops', 'sdrops', 'host') + (
+                        ('pwmerr',) if cur.version >= 2 else ('skip', 'stall')):
                             if key in fields and int(fields[key]) != 0:
                                 cur.integrity_issues.add(f'{key}={fields[key]}')
                             if final and key not in fields:
@@ -243,7 +250,8 @@ def parse_log(path):
                     cur.strobe.setdefault(int(p[2]), []).append((int(p[1]), int(p[3]), int(p[4])))
                 elif t == 'Z':
                     # Z,<seq>,<tick>,<raw nmea with its own commas>
-                    seq = int(p[1]); tick = int(p[2])
+                    seq = int(p[1]);
+                    tick = int(p[2])
                     nmea = line.split(',', 3)[3]
                     cur.tod_seq.append(seq)
                     sec = parse_nmea_unix(nmea)
@@ -296,7 +304,7 @@ def build_anchors(lg, convention, tol_ppm=200.0, verbose=True):
         return np.empty((0, 2)), 0.0
     pps_ticks = np.array(sorted(t for _, t in lg.pps), dtype=np.int64)
     hz = lg.tick_hz
-    anchors = {}   # pps_tick -> unix_sec
+    anchors = {}  # pps_tick -> unix_sec
     lags = []
     for _, z_tick, sec in lg.tod:
         i = np.searchsorted(pps_ticks, z_tick)
@@ -308,8 +316,8 @@ def build_anchors(lg, convention, tol_ppm=200.0, verbose=True):
             cand = after
         if cand is None:
             continue
-        lag = (z_tick - cand) / hz          # + => sentence after its PPS (preceding convention)
-        if abs(lag) > 1.5:                  # no PPS anywhere near this sentence
+        lag = (z_tick - cand) / hz  # + => sentence after its PPS (preceding convention)
+        if abs(lag) > 1.5:  # no PPS anywhere near this sentence
             continue
         lags.append(lag)
         if int(cand) in anchors and anchors[int(cand)] != int(sec):
@@ -317,7 +325,7 @@ def build_anchors(lg, convention, tol_ppm=200.0, verbose=True):
         anchors[int(cand)] = int(sec)
     if not anchors:
         return np.empty((0, 2)), 0.0
-    arr = np.array(sorted(anchors.items()), dtype=np.int64)   # [[tick, sec], ...]
+    arr = np.array(sorted(anchors.items()), dtype=np.int64)  # [[tick, sec], ...]
     med_lag = float(np.median(lags)) if lags else 0.0
 
     # Reject implausible anchors: ref rate = median over adjacent pairs, chain vs last KEPT.
@@ -330,7 +338,7 @@ def build_anchors(lg, convention, tol_ppm=200.0, verbose=True):
         # corrupt anchor sets self-validate (a 1 s mislabel shifts the rate ~100%)
         if abs(ref - hz) / hz > 500e-6:
             print(f"  ! anchor rate {ref:.0f} deviates from nominal {hz:.0f} by "
-                  f"{abs(ref-hz)/hz*1e6:.0f} ppm; using nominal for plausibility", file=sys.stderr)
+                  f"{abs(ref - hz) / hz * 1e6:.0f} ppm; using nominal for plausibility", file=sys.stderr)
             ref = hz
 
         def _plaus(i, j):
@@ -357,7 +365,7 @@ def build_anchors(lg, convention, tol_ppm=200.0, verbose=True):
         arr = arr[keep]
 
     if verbose:
-        print(f"  anchors: {len(arr)} PPS<->ToD pairs, median lag {med_lag*1e3:.1f} ms "
+        print(f"  anchors: {len(arr)} PPS<->ToD pairs, median lag {med_lag * 1e3:.1f} ms "
               f"({'preceding' if med_lag >= 0 else 'following'} side)", file=sys.stderr)
     return arr, med_lag
 
@@ -366,9 +374,9 @@ def build_anchors(lg, convention, tol_ppm=200.0, verbose=True):
 # Centered sliding-window robust fit: tick -> GNSS second
 # ---------------------------------------------------------------------------
 class CenteredFitter:
-    def __init__(self, anchors, tick_hz, window_s=10.0, min_pts=4):
-        self.at = anchors[:, 0].astype(np.int64)         # pps ticks (sorted)
-        self.asec = anchors[:, 1].astype(np.int64)       # unix seconds
+    def __init__(self, anchors, tick_hz, window_s=10.0, min_pts=MIN_ANCHORS):
+        self.at = anchors[:, 0].astype(np.int64)  # pps ticks (sorted)
+        self.asec = anchors[:, 1].astype(np.int64)  # unix seconds
         self.hz = tick_hz
         self.half = int(window_s * tick_hz / 2)
         self.min_pts = min_pts
@@ -380,11 +388,11 @@ class CenteredFitter:
         x = (xt - t0).astype(np.float64)
         y = (ys - s0).astype(np.float64)
         kept = xt.copy()
-        floor = 5.0 / self.hz                    # ~5 ticks: don't reject on mere quantization
+        floor = 5.0 / self.hz  # ~5 ticks: don't reject on mere quantization
         for _ in range(2):
             if len(x) < 4:
                 break
-            b, a = np.polyfit(x, y, 1)           # y = a + b*x
+            b, a = np.polyfit(x, y, 1)  # y = a + b*x
             r = y - (a + b * x)
             thr = max(3.0 * np.std(r), 3.0 * floor)
             m = np.abs(r) <= thr
@@ -430,9 +438,33 @@ class CenteredFitter:
                         np.all(np.diff(kept) <= 1.5 * self.hz))
         if not np.isfinite(a) or not np.isfinite(b) or not np.isfinite(rms) or b <= 0:
             return None, 0.0, 0.0, n, False, False
-        rel = a + b * float(tick - t0)              # small-offset domain: no float64 abs-second
+        rel = a + b * float(tick - t0)  # small-offset domain: no float64 abs-second
         w = int(np.floor(rel))
         return int(s0) + w, float(rel - w), rms, n, True, centered
+
+
+# ---------------------------------------------------------------------------
+# Free-run fallback (no GNSS anchors): origin tick = GPS epoch, nominal tick rate
+# ---------------------------------------------------------------------------
+class FreeRunClock:
+    def __init__(self, origin_tick, tick_hz):
+        self.t0 = int(origin_tick)
+        self.hz = tick_hz
+
+    def gnss(self, tick):
+        """Same tuple as CenteredFitter.gnss; no fit: rms 0, no anchors, never centered."""
+        rel = (int(tick) - self.t0) / self.hz  # tick offset exact in float64
+        w = int(np.floor(rel))  # floor: pre-origin edges stay consistent
+        return GPS_EPOCH_UNIX + w, float(rel - w), 0.0, 0, True, False
+
+
+def first_trigger_tick(lg):
+    """Free-run origin: earliest active-going trigger tick; any logged edge if none; else None."""
+    ticks = [tick for ch, ev in lg.trig.items() for _, level, tick in ev
+             if level == lg.trig_cfg.get(ch, {}).get('active_high', 1)]
+    if not ticks:
+        ticks = [e[2] for store in (lg.trig, lg.strobe) for ev in store.values() for e in ev]
+    return min(ticks) if ticks else None
 
 
 # ---------------------------------------------------------------------------
@@ -453,10 +485,10 @@ def exposures(edges, active_level):
     start = None
     start_seq = None
     last_seq = None
-    pend = False                    # seq gap seen: next emitted exposure suspect
+    pend = False  # seq gap seen: next emitted exposure suspect
     for seq, level, tick in sorted(edges, key=lambda e: e[2]):
         if last_seq is not None and seq != last_seq + 1:
-            pend = True             # lost edge(s) in between; pairing may be wrong
+            pend = True  # lost edge(s) in between; pairing may be wrong
         last_seq = seq
         if level == active_level:
             if start is not None:
@@ -509,19 +541,22 @@ def main():
     ap.add_argument('-o', '--out', default='frames.csv', help="per-frame CSV output")
     ap.add_argument('--edges', help="also write a per-edge CSV (all T and S with GNSS time)")
     ap.add_argument('--window', type=float, default=10.0, help="centered fit window, seconds (default 10)")
-    ap.add_argument('--convention', choices=['preceding', 'following'], required=True,
-                    help="verified ToD<->PPS pairing side; nearest-PPS timing is not sufficient evidence")
-    ap.add_argument('--tod-scale', choices=['utc', 'gps'], required=True,
-                    help="verified time scale of the receiver's NMEA calendar fields")
-    ap.add_argument('--gps', action='store_true', help="output GPS seconds instead of UTC/Unix")
-    ap.add_argument('--leap', type=int, help="verified GPS-UTC offset; required for GPS input or output")
+    ap.add_argument('--convention', choices=['preceding', 'following'],
+                    help="verified ToD<->PPS pairing side, required when the log has PPS + ToD; "
+                         "nearest-PPS timing is not sufficient evidence")
+    ap.add_argument('--leap', type=int, default=GPS_UTC_LEAP_S,
+                    help=f"GPS-UTC offset for the GPS columns, seconds (default {GPS_UTC_LEAP_S}, "
+                         "valid since 2017-01-01); free-run fallback always uses 0")
     ap.add_argument('--link', default='', help="strobe:trigger channel map, e.g. 0:0,1:1 (default same index)")
+    ap.add_argument('--strobe-ah', default='',
+                    help="strobe:active_high override of the log header polarity, e.g. 2:0,3:0 "
+                         "(0 = exposure is the low phase)")
     ap.add_argument('--session', type=int, help="process session N (1-based) of a multi-session log")
     args = ap.parse_args()
     if not np.isfinite(args.window) or not 0 < args.window <= 3600:
         ap.error("--window must be finite and in (0, 3600]")
-    if (args.gps or args.tod_scale == 'gps') and (args.leap is None or not 0 <= args.leap <= 128):
-        ap.error("GPS conversion requires an explicit verified --leap in [0, 128]")
+    if not 0 <= args.leap <= 128:
+        ap.error("--leap must be in [0, 128]")
 
     sessions = parse_log(args.log)
     if args.session is not None and not (1 <= args.session <= len(sessions)):
@@ -541,8 +576,6 @@ def main():
     lg = sessions[(pick or 1) - 1]
     if not np.isfinite(lg.tick_hz) or lg.tick_hz <= 0:
         ap.error("invalid nominal tick frequency in log header")
-    if args.tod_scale == 'gps':
-        lg.tod = [(seq, tick, sec - args.leap) for seq, tick, sec in lg.tod]
 
     print(f"parsed: {len(lg.pps)} PPS, {sum(len(v) for v in lg.trig.values())} trig edges, "
           f"{sum(len(v) for v in lg.strobe.values())} strobe edges, {len(lg.tod)} ToD "
@@ -564,21 +597,41 @@ def main():
     if lg.time_sources.get('T') == 'PWM_ISR_sample':
         print('  T timestamps include PWM interrupt latency; a later T sample stays unmatched, '
               'and latency_us is an observed difference, not calibrated camera latency.', file=sys.stderr)
-    anchors, _ = build_anchors(lg, args.convention)
-    if len(anchors) < 4:
-        print("FATAL: not enough PPS<->ToD anchors to fit; check ToD wiring / --convention", file=sys.stderr)
-        return 1
-    fitter = CenteredFitter(anchors, lg.tick_hz, args.window)
+    anchors = np.empty((0, 2))
+    if lg.pps and lg.tod:
+        if args.convention is None:
+            ap.error("log has PPS and ToD: a verified --convention preceding|following is required")
+        anchors, _ = build_anchors(lg, args.convention)
+    free_run = len(anchors) < MIN_ANCHORS
+    if free_run:
+        # no GNSS time (indoor test): keep going on nominal ticks instead of aborting
+        origin = first_trigger_tick(lg) or 0
+        print(f"!!! no usable GNSS time: {len(lg.pps)} PPS, {len(lg.tod)} valid ToD, "
+              f"{len(anchors)} anchor(s), {MIN_ANCHORS} needed", file=sys.stderr)
+        if lg.pps or lg.tod_seq:
+            print("!!! PPS/ToD partially present: check PPS/ToD wiring and --convention "
+                  "if GNSS time was expected", file=sys.stderr)
+        print(f"!!! FREE-RUN fallback: first trigger (tick {origin}) = GPS epoch 1980-01-06 00:00:00, "
+              f"nominal {lg.tick_hz:.3f} Hz, no drift correction; relative timing only, flag 0x20",
+              file=sys.stderr)
+        clock = FreeRunClock(origin, lg.tick_hz)
+        leap = 0  # GPS epoch: GPS-UTC = 0
+    else:
+        clock = CenteredFitter(anchors, lg.tick_hz, args.window)
+        leap = args.leap
+    time_base = 'free_run' if free_run else 'gnss'
+    gps_off = leap - GPS_EPOCH_UNIX  # UTC/Unix -> GPS, INTEGER seconds only
 
-    def to_out(whole):
-        # GPS/leap offsets in INTEGER seconds only
-        return whole + args.leap - GPS_EPOCH_UNIX if args.gps else whole
-
-    def split(whole, frac):
+    def stamp(whole, frac):
+        # -> (utc_sec, gps_sec, ns text); scales differ by whole seconds, ns shared
         ns = int(round(frac * 1e9))
         if ns >= 1_000_000_000:
-            whole += 1; ns -= 1_000_000_000
-        return whole, ns
+            whole += 1;
+            ns -= 1_000_000_000
+        return whole, whole + gps_off, f"{ns:09d}"
+
+    def rms_text(rms, ok):
+        return f"{rms * 1e9:.0f}" if ok and not free_run else ''  # free-run: no fit
 
     # channel link map
     link = {}
@@ -594,28 +647,48 @@ def main():
             if sc in lg.trig_cfg:
                 link[sc] = sc
 
+    # strobe polarity override: header ah= recorded before camera polarity was verified
+    if args.strobe_ah:
+        for pair in args.strobe_ah.split(','):
+            try:
+                a, b = pair.split(':')
+                sch, ah = int(a), int(b)
+                if ah not in (0, 1):
+                    raise ValueError
+            except ValueError:
+                ap.error(f"--strobe-ah: bad pair '{pair}' (expected strobe:0|1, e.g. 2:0,3:0)")
+            if sch not in lg.strobe_cfg and sch not in lg.strobe:
+                ap.error(f"--strobe-ah: strobe channel {sch} not in this log")
+            cfg = lg.strobe_cfg.setdefault(sch, {})
+            print(f"  strobe[{sch}] polarity override: header ah={cfg.get('active_high', 'unset')} -> ah={ah}",
+                  file=sys.stderr)
+            cfg['active_high'] = ah
+
     # optional per-edge CSV
     if args.edges:
         with open(args.edges, 'x', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow("kind,ch,seq,level,tick,sec,ns,fit_rms_ns,n_anchors,centered,fit_valid,time_source".split(','))
+            writer.writerow(("kind,ch,seq,level,tick,utc_sec,gps_sec,ns,fit_rms_ns,n_anchors,centered,fit_valid,"
+                             "time_base,time_source").split(','))
             for kind, store in (('T', lg.trig), ('S', lg.strobe)):
                 for ch, ev in store.items():
                     for seq, level, tick in ev:
-                        w, fq, rms, n, ok, cen = fitter.gnss(tick)
-                        s, ns = split(to_out(w), fq) if ok else ('', '')
-                        writer.writerow([kind, ch, seq, level, tick, s, f"{ns:09d}" if ok else '',
-                                         f"{rms*1e9:.0f}" if ok else '', n, int(cen), int(ok), lg.time_sources.get(kind, 'legacy_unspecified')])
+                        w, fq, rms, n, ok, cen = clock.gnss(tick)
+                        us, gs, ns = stamp(w, fq) if ok else ('', '', '')
+                        writer.writerow([kind, ch, seq, level, tick, us, gs, ns, rms_text(rms, ok), n,
+                                         int(cen), int(ok), time_base,
+                                         lg.time_sources.get(kind, 'legacy_unspecified')])
         print(f"wrote per-edge CSV: {args.edges}", file=sys.stderr)
 
     # per-frame CSV
     nframes = 0
     with open(args.out, 'x', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(("strobe,name,frame,start_sec,start_ns,end_sec,end_ns,mid_sec,mid_ns,"
-                         "dur_us,trig_sec,trig_ns,latency_us,fit_rms_ns,n_anchors,start_seq,trig_seq,flags,"
-                         "start_tick,end_tick,trig_tick,association_verified,output_time_scale,"
-                         "tod_scale,pps_convention,leap_seconds,trigger_time_source,strobe_time_source").split(','))
+        writer.writerow(("strobe,name,frame,start_utc_sec,start_gps_sec,start_ns,end_utc_sec,end_gps_sec,end_ns,"
+                         "mid_utc_sec,mid_gps_sec,mid_ns,dur_us,trig_utc_sec,trig_gps_sec,trig_ns,latency_us,"
+                         "fit_rms_ns,n_anchors,start_seq,trig_seq,flags,start_tick,end_tick,trig_tick,"
+                         "association_verified,time_base,pps_convention,leap_seconds,strobe_active_high,"
+                         "trigger_time_source,strobe_time_source").split(','))
         for sch, ev in sorted(lg.strobe.items()):
             if not ev:
                 continue
@@ -624,14 +697,15 @@ def main():
             exps = exposures(ev, active)
 
             tch = link.get(sch)
-            trigs = rising_edges(lg.trig.get(tch, []), lg.trig_cfg.get(tch, {}).get('active_high', 1)) if tch is not None else []
+            trigs = rising_edges(lg.trig.get(tch, []),
+                                 lg.trig_cfg.get(tch, {}).get('active_high', 1)) if tch is not None else []
             freq = lg.trig_cfg.get(tch, {}).get('freq', 0.0) if tch is not None else 0.0
             half = int(0.5 * lg.tick_hz / freq) if freq > 0 else 0
 
             frames = match_frames(exps, trigs, half)
             for k, fr in enumerate(frames):
-                sw, sf, rms_s, n_s, ok_s, cen_s = fitter.gnss(fr['start_tick'])
-                ew, ef, _, _, ok_e, cen_e = fitter.gnss(fr['end_tick']) if fr['end_tick'] is not None else (
+                sw, sf, rms_s, n_s, ok_s, cen_s = clock.gnss(fr['start_tick'])
+                ew, ef, _, _, ok_e, cen_e = clock.gnss(fr['end_tick']) if fr['end_tick'] is not None else (
                     None, 0.0, 0.0, 0, False, False)
                 flags = 0 if log_complete else 0x40
                 if not (ok_s and ok_e):
@@ -640,52 +714,49 @@ def main():
                     flags |= 0x10
                 if fr['suspect']:
                     flags |= 0x04
-                if not (cen_s and cen_e):
-                    flags |= 0x08          # not a centered fit (session edge / gap)
-                ss = sns = es = ens = ms = mns = dur_us = ''
+                if free_run:
+                    flags |= 0x20  # nominal-rate time from GPS epoch, no GNSS
+                elif not (cen_s and cen_e):
+                    flags |= 0x08  # not a centered fit (session edge / gap)
+                s_utc = s_gps = s_ns = e_utc = e_gps = e_ns = m_utc = m_gps = m_ns = dur_us = ''
                 if ok_s:
-                    ss, ns = split(to_out(sw), sf)
-                    sns = f"{ns:09d}"
+                    s_utc, s_gps, s_ns = stamp(sw, sf)
                 if ok_e:
-                    es, ns = split(to_out(ew), ef)
-                    ens = f"{ns:09d}"
+                    e_utc, e_gps, e_ns = stamp(ew, ef)
                 if ok_s and ok_e:
                     # Midpoint in a small-offset domain, without an absolute float timestamp.
                     mrel = sf + 0.5 * ((ew - sw) + (ef - sf))
                     mfl = int(np.floor(mrel))
-                    ms, ns = split(to_out(sw + mfl), mrel - mfl)
-                    mns = f"{ns:09d}"
+                    m_utc, m_gps, m_ns = stamp(sw + mfl, mrel - mfl)
                     dur_us = f"{((ew - sw) + (ef - sf)) * 1e6:.3f}"
-                trig_out = tr_ns = ''
-                lat_us = ''
+                t_utc = t_gps = t_ns = lat_us = ''
                 tseq = fr['trig_seq'] if fr['trig_seq'] is not None else ''
                 if tch is not None and lg.truncated.get(tch // 2, (None,))[0] == tseq:
                     flags |= 0x80  # trigger pulse shortened by STOP; not a normal frame
                 if fr['trig_tick'] is not None:
-                    tw, tf, _, _, ok_t, _ = fitter.gnss(fr['trig_tick'])
+                    tw, tf, _, _, ok_t, _ = clock.gnss(fr['trig_tick'])
                     if ok_t:
-                        ts, tns = split(to_out(tw), tf)
-                        trig_out, tr_ns = ts, f"{tns:09d}"
+                        t_utc, t_gps, t_ns = stamp(tw, tf)
                         if ok_s:
-                            lat_us = f"{((sw - tw) + (sf - tf))*1e6:.3f}"
+                            lat_us = f"{((sw - tw) + (sf - tf)) * 1e6:.3f}"
                     else:
-                        flags |= 0x02      # trigger matched but fit failed
+                        flags |= 0x02  # trigger matched but fit failed
                 else:
-                    flags |= 0x02          # no trigger matched
-                writer.writerow([sch, name, k, ss, sns, es, ens, ms, mns, dur_us,
-                                 trig_out, tr_ns, lat_us, f"{rms_s*1e9:.0f}" if ok_s else '', n_s,
+                    flags |= 0x02  # no trigger matched
+                writer.writerow([sch, name, k, s_utc, s_gps, s_ns, e_utc, e_gps, e_ns, m_utc, m_gps, m_ns,
+                                 dur_us, t_utc, t_gps, t_ns, lat_us, rms_text(rms_s, ok_s), n_s,
                                  fr['start_seq'], tseq, flags, fr['start_tick'], fr['end_tick'],
-                                 fr['trig_tick'], 0, 'gps' if args.gps else 'utc', args.tod_scale,
-                                 args.convention, args.leap if args.leap is not None else '',
-                                 lg.time_sources.get('T', 'legacy_unspecified'),
+                                 fr['trig_tick'], 0, time_base, '' if free_run else args.convention, leap,
+                                 int(active), lg.time_sources.get('T', 'legacy_unspecified'),
                                  lg.time_sources.get('S', 'legacy_unspecified')])
                 nframes += 1
 
-    print(f"wrote {nframes} frames -> {args.out}"
-          + ("  (GPS seconds)" if args.gps else "  (UTC/Unix seconds)"), file=sys.stderr)
+    print(f"wrote {nframes} frames -> {args.out}  (UTC/Unix + GPS seconds, GPS-UTC={leap} s, "
+          + ("FREE-RUN from GPS epoch, not GNSS time)" if free_run else "GNSS fit)"), file=sys.stderr)
     print("flags: 0x01 incomplete-time-fit  0x02 no-trigger-time(unmatched/fit-fail)  "
           "0x04 exposure-suspect(lost edge)  0x08 non-centered-fit(edge/gap)  0x10 missing-end-edge  "
-          "0x40 log-integrity-incomplete  0x80 trigger-truncated-on-STOP; "
+          "0x20 free-run-time(no GNSS anchors)  0x40 log-integrity-incomplete  "
+          "0x80 trigger-truncated-on-STOP; "
           "trigger matching is heuristic, association_verified=0", file=sys.stderr)
     return 0
 

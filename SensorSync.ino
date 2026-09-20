@@ -78,53 +78,61 @@ static bool waitTx(int bytes, uint32_t timeout_ms) {
 
 // ---------------------------------------------------------------------------
 static void printHealth(bool final) {
-    if (Serial.availableForWrite() < 512) return;
-    const uint32_t errors = channels::pwmErrors(0) + channels::pwmErrors(1);
-    uint32_t seq; uint64_t tick;
-    const unsigned cuts = unsigned(channels::truncation(0, seq, tick)) + unsigned(channels::truncation(1, seq, tick));
-    Serial.printf(final
-        ? "#HFINAL up=%lu en=%d pps=%lu ppsdt=%.6f ppsdrops=%lu tod=%lu todb=%lu todtrunc=%lu tdrops=%lu sdrops=%lu host=%lu pwmerr=%lu trunc=%u\n"
-        : "#H up=%lu en=%d pps=%lu ppsdt=%.6f ppsdrops=%lu tod=%lu todb=%lu todtrunc=%lu tdrops=%lu sdrops=%lu host=%lu pwmerr=%lu trunc=%u\n",
-        millis(), channels::enabled() ? 1 : 0, timesync::ppsRawCount(), timesync::lastPpsIntervalSec(),
-        timesync::ppsDrops(), timesync::todCount(), timesync::todBytes(), timesync::todTruncated(),
-        channels::trigDrops(), channels::strobeDrops(), static_cast<unsigned long>(g_host_drops),
-        static_cast<unsigned long>(errors), cuts);
-    if (final) return;
-    for (uint8_t i = 0; i < TRIG_MAX; ++i) {
-        if (Serial.availableForWrite() < 128) return;
-        Serial.printf("#Ht %u %s n=%lu pwmerr=%lu\n", i, TRIG_CFG[i].name,
-                      channels::trigCount(i), channels::pwmErrors(i / 2));
-    }
-    for (uint8_t i = 0; i < STROBE_MAX; ++i) {
-        if (Serial.availableForWrite() < 128) return;
-        Serial.printf("#Hs %u %s n=%lu\n", i, STROBE_CFG[i].name, channels::strobeCount(i));
-    }
+	if (Serial.availableForWrite() < 512)
+		return;
+	const uint32_t errors = channels::pwmErrors(0) + channels::pwmErrors(1);
+	uint32_t seq;
+	uint64_t tick;
+	const unsigned cuts = unsigned(channels::truncation(0, seq, tick)) + unsigned(channels::truncation(1, seq, tick));
+	Serial.printf(final ? "#HFINAL up=%lu en=%d pps=%lu ppsdt=%.6f ppsdrops=%lu tod=%lu todb=%lu todtrunc=%lu tdrops=%lu sdrops=%lu "
+						  "host=%lu pwmerr=%lu trunc=%u\n"
+						: "#H up=%lu en=%d pps=%lu ppsdt=%.6f ppsdrops=%lu tod=%lu todb=%lu todtrunc=%lu tdrops=%lu sdrops=%lu "
+						  "host=%lu pwmerr=%lu trunc=%u\n",
+				  millis(), channels::enabled() ? 1 : 0, timesync::ppsRawCount(), timesync::lastPpsIntervalSec(), timesync::ppsDrops(),
+				  timesync::todCount(), timesync::todBytes(), timesync::todTruncated(), channels::trigDrops(), channels::strobeDrops(),
+				  static_cast<unsigned long>(g_host_drops), static_cast<unsigned long>(errors), cuts);
+	if (final)
+		return;
+	for (uint8_t i = 0; i < TRIG_MAX; ++i) {
+		if (Serial.availableForWrite() < 128)
+			return;
+		Serial.printf("#Ht %u %s n=%lu pwmerr=%lu\n", i, TRIG_CFG[i].name, channels::trigCount(i), channels::pwmErrors(i / 2));
+	}
+	for (uint8_t i = 0; i < STROBE_MAX; ++i) {
+		if (Serial.availableForWrite() < 128)
+			return;
+		Serial.printf("#Hs %u %s n=%lu\n", i, STROBE_CFG[i].name, channels::strobeCount(i));
+	}
 }
 
 static bool printHeader() {
-    if (!waitTx(128, 250)) return false;
-    Serial.printf("#LOG,SensorSync-logger,2,tick_hz=%.3f\n", timebase::nominalHz());
-    const auto requested = channels::requestedRates();
-    for (uint8_t g = 0; g < 2; ++g) {
-        if (!waitTx(192, 250)) return false;
-        const auto &t = channels::timing(g);
-        Serial.printf("#GROUP,%s,requested=%.8f,actual=%.8f,pulse_us=%.6f,clock_hz=%.6f,div=%u,period=%u,width=%u\n",
-                      trigger::name(static_cast<trigger::Group>(g)), requested.hz[g], t.actual_hz,
-                      t.pulse_us, t.clock_hz, 1u << t.prescale, t.period, t.width);
-    }
-    for (uint8_t i = 0; i < TRIG_MAX; ++i) {
-        if (!waitTx(128, 250)) return false;
-        Serial.printf("#TRIG,%u,%s,%u,%.8f,ah=%u\n", i, TRIG_CFG[i].name, TRIG_CFG[i].pin,
-                      channels::freqHz(i), TRIG_CFG[i].active_high ? 1 : 0);
-    }
-    for (uint8_t i = 0; i < STROBE_MAX; ++i) {
-        if (!waitTx(128, 250)) return false;
-        Serial.printf("#STROBE,%u,%s,%u,ah=%u\n", i, STROBE_CFG[i].name, STROBE_CFG[i].pin,
-                      STROBE_CFG[i].active_high ? 1 : 0);
-    }
-    if (!waitTx(128, 250)) return false;
-    Serial.println("#TIME,T=PWM_ISR_sample,S=GPIO_ISR_sample,Z=sentence_read,P=GPIO_ISR_sample");
-    return true;
+	if (!waitTx(128, 250))
+		return false;
+	Serial.printf("#LOG,SensorSync-logger,2,tick_hz=%.3f\n", timebase::nominalHz());
+	const auto requested = channels::requestedRates();
+	for (uint8_t g = 0; g < 2; ++g) {
+		if (!waitTx(192, 250))
+			return false;
+		const auto &t = channels::timing(g);
+		Serial.printf("#GROUP,%s,requested=%.8f,actual=%.8f,pulse_us=%.6f,clock_hz=%.6f,div=%u,period=%u,width=%u\n",
+					  trigger::name(static_cast<trigger::Group>(g)), requested.hz[g], t.actual_hz, t.pulse_us, t.clock_hz,
+					  1u << t.prescale, t.period, t.width);
+	}
+	for (uint8_t i = 0; i < TRIG_MAX; ++i) {
+		if (!waitTx(128, 250))
+			return false;
+		Serial.printf("#TRIG,%u,%s,%u,%.8f,ah=%u\n", i, TRIG_CFG[i].name, TRIG_CFG[i].pin, channels::freqHz(i),
+					  TRIG_CFG[i].active_high ? 1 : 0);
+	}
+	for (uint8_t i = 0; i < STROBE_MAX; ++i) {
+		if (!waitTx(128, 250))
+			return false;
+		Serial.printf("#STROBE,%u,%s,%u,ah=%u\n", i, STROBE_CFG[i].name, STROBE_CFG[i].pin, STROBE_CFG[i].active_high ? 1 : 0);
+	}
+	if (!waitTx(128, 250))
+		return false;
+	Serial.println("#TIME,T=PWM_ISR_sample,S=GPIO_ISR_sample,Z=sentence_read,P=GPIO_ISR_sample");
+	return true;
 }
 
 
@@ -140,8 +148,9 @@ static void printIdle() {
 // ---------------------------------------------------------------------------
 // Drain every queued event through emit() before a session boundary, so the
 // tail of a session is not wiped with the rings. Producers must already be
-// gated off (g_running false + channels disabled). Bounded by `deadline_ms`.
-static void drainAll(uint32_t deadline_ms) {
+// gated off for the final drain. During the bounded STOP tail, GPIO producers
+// remain enabled and another drain follows; a nonempty queue is not yet loss.
+static void drainAll(uint32_t deadline_ms, bool require_empty = true) {
 	char buf[kLineMax];
 	const uint32_t t0 = millis();
 	bool more = true;
@@ -176,7 +185,8 @@ static void drainAll(uint32_t deadline_ms) {
 			}
 		}
 	}
-	if (more) ++g_host_drops; // deadline prevented confirmation that the tail was drained
+	if (more && require_empty)
+		++g_host_drops;	 // final tail could not be confirmed drained
 }
 
 
@@ -190,20 +200,33 @@ static void drainAll(uint32_t deadline_ms) {
 // next override or reboot; the #TRIG header always shows the effective rate.
 static void closeRunningSession() {
 	g_running = false;
-	channels::setEnabled(false);
+	channels::setEnabled(false, true);	// PWM off; GPIO exposure edges remain live
+	// A STOP may precede a delayed exposure. Keep the entire bounded window,
+	// even if no exposure is active yet. This is a drain budget, not a claimed
+	// camera timing guarantee; late/missing exposures also fail host accounting.
+	const uint32_t tail_start = millis();
+	while (millis() - tail_start < 1000) {
+		drainAll(10, false);
+		delay(1);
+	}
+	channels::setEnabled(false);  // freeze edge capture before final health/STOP
+	const uint8_t pending_strobes = channels::pendingStrobes();
+	if (pending_strobes && waitTx(96, 250))
+		Serial.printf("#ERR,exposure_tail_timeout,mask=%u\n", pending_strobes);
 	leds::reset();
-    // STOP may truncate a high pulse; no synthetic T falling edge is emitted.
-    for (uint8_t g = 0; g < 2; ++g) {
-        uint32_t seq; uint64_t tick;
-        if (channels::truncation(g, seq, tick) && waitTx(128, 250))
-            Serial.printf("#TRUNC,%u,%lu,%llu\n", g, static_cast<unsigned long>(seq),
-                          static_cast<unsigned long long>(tick));
-    }
-    drainAll(500); // flush the session tail before the marker
+	// STOP may truncate a high pulse; no synthetic T falling edge is emitted.
+	for (uint8_t g = 0; g < 2; ++g) {
+		uint32_t seq;
+		uint64_t tick;
+		if (channels::truncation(g, seq, tick) && waitTx(128, 250))
+			Serial.printf("#TRUNC,%u,%lu,%llu\n", g, static_cast<unsigned long>(seq), static_cast<unsigned long long>(tick));
+	}
+	drainAll(500);	// flush the session tail before the marker
 	// Preserve final loss counters BEFORE resetStats/resetCounts. A normal STOP
 	// marker is emitted only after the final health block could be sent.
 	const bool final_stats_sent = waitTx(512, 250);
-	if (final_stats_sent) printHealth(true);
+	if (final_stats_sent)
+		printHealth(true);
 	if (final_stats_sent && waitTx(512, 250)) {	 // marker line can exceed kLineMax (long path)
 		Serial.printf("#SESSION,STOP,%s\n", g_session_path);
 	}
@@ -227,34 +250,40 @@ static void stopSession() {
 
 // Validate the entire request before closing an existing session or changing rates.
 static void startSession(const char *path, const char *freqspec = nullptr) {
-    auto rates = channels::requestedRates();
-    if (!trigger::parseRates(freqspec, rates) || !channels::validateRates(rates)) {
-        if (waitTx(64, 50)) Serial.println("#ERR,bad_freq");
-        return;
-    }
-    if (g_running) closeRunningSession();
-    timesync::flushInput();
-    timesync::resetStats();
-    channels::resetCounts();
-    g_host_drops = 0;
-    leds::reset();
-    if (!channels::applyRates(rates)) {
-        if (waitTx(64, 50)) Serial.println("#ERR,pwm_config");
-        return;
-    }
-    strncpy(g_session_path, path ? path : "", sizeof(g_session_path) - 1);
-    g_session_path[sizeof(g_session_path) - 1] = 0;
-    if (!waitTx(512, 250)) return;
-    Serial.printf("#SESSION,START,%s\n", g_session_path);
-    if (!printHeader() || !waitTx(64, 250)) return; // no output without a complete header
-    g_running = true;
-    if (!channels::setEnabled(true)) {
-        if (waitTx(64, 50)) Serial.println("#ERR,pwm_start");
-        closeRunningSession();
-        return;
-    }
-    // Version 2 clients acknowledge only READY, after the hardware actually starts.
-    Serial.println("#READY");
+	auto rates = channels::requestedRates();
+	if (!trigger::parseRates(freqspec, rates) || !channels::validateRates(rates)) {
+		if (waitTx(64, 50))
+			Serial.println("#ERR,bad_freq");
+		return;
+	}
+	if (g_running)
+		closeRunningSession();
+	timesync::flushInput();
+	timesync::resetStats();
+	channels::resetCounts();
+	g_host_drops = 0;
+	leds::reset();
+	if (!channels::applyRates(rates)) {
+		if (waitTx(64, 50))
+			Serial.println("#ERR,pwm_config");
+		return;
+	}
+	strncpy(g_session_path, path ? path : "", sizeof(g_session_path) - 1);
+	g_session_path[sizeof(g_session_path) - 1] = 0;
+	if (!waitTx(512, 250))
+		return;
+	Serial.printf("#SESSION,START,%s\n", g_session_path);
+	if (!printHeader() || !waitTx(64, 250))
+		return;	 // no output without a complete header
+	g_running = true;
+	if (!channels::setEnabled(true)) {
+		if (waitTx(64, 50))
+			Serial.println("#ERR,pwm_start");
+		closeRunningSession();
+		return;
+	}
+	// Version 2 clients acknowledge only READY, after the hardware actually starts.
+	Serial.println("#READY");
 }
 
 
@@ -323,13 +352,15 @@ void setup() {
 	Serial.println("# SensorSync-logger ready (idle). commands: START [freq=FX:hz,JAI:hz] [path] | STOP | s (status) | h (header)");
 }
 
+
 // ---------------------------------------------------------------------------
 void loop() {
-    channels::pollHealth();
-    if (g_running && channels::faulted()) {
-        if (waitTx(64, 50)) Serial.println("#ERR,pwm_event_loss");
-        closeRunningSession();
-    }
+	channels::pollHealth();
+	if (g_running && channels::faulted()) {
+		if (waitTx(64, 50))
+			Serial.println("#ERR,pwm_event_loss");
+		closeRunningSession();
+	}
 	char buf[kLineMax];
 
 	// drain only while a session runs; idle ISRs push nothing
@@ -380,7 +411,8 @@ void loop() {
 		const char c = static_cast<char>(Serial.read());
 		if (c == '\n' || c == '\r') {
 			if (cmd_overflow) {
-				if (waitTx(64, 50)) Serial.println("#ERR,command_too_long");
+				if (waitTx(64, 50))
+					Serial.println("#ERR,command_too_long");
 				cmdlen = 0;
 				cmd_overflow = false;
 			} else if (cmdlen > 0) {
@@ -396,7 +428,8 @@ void loop() {
 	}
 
 	// Visible activity from the counters; keep GPIO work out of the timing ISRs.
-	if (g_running) leds::poll();
+	if (g_running)
+		leds::poll();
 
 	// heartbeat: #H while running, #IDLE while waiting
 	static uint32_t last = 0;

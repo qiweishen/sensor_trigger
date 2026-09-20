@@ -1,3 +1,4 @@
+import calendar
 import csv
 import math
 import os
@@ -55,36 +56,172 @@ class PostprocessTests(unittest.TestCase):
         frames = pp.match_frames([(1, 2, 1, False), (3, 4, 3, False)], [(1, 0)], 10)
         self.assertTrue(all(fr['trig_seq'] is None and fr['suspect'] for fr in frames))
 
-    def test_csv_duration_uses_calibrated_time_and_blanks_failed_fit(self):
-        hz = 75_007_500  # +100 ppm versus nominal
-        lines = ['#SESSION,START,test', '#LOG,SensorSync-logger,1,tick_hz=75000000',
-                 '#TRIG,0,FX10E-1,33,50,ah=1', '#STROBE,0,FX10E_EXP-1,18,ah=1']
-        for i in range(21):
+    HEADER = ['#SESSION,START,test', '#LOG,SensorSync-logger,1,tick_hz=75000000',
+              '#TRIG,0,FX10E-1,33,50,ah=1', '#STROBE,0,FX10E_EXP-1,18,ah=1']
+    FOOTER = ['#HFINAL ppsdrops=0 todtrunc=0 tdrops=0 sdrops=0 host=0 skip=0 stall=0',
+              '#SESSION,STOP,test']
+
+    @staticmethod
+    def gnss_lines(hz, seconds=21):
+        # PPS i+1 labelled 2026-09-09 00:00:ii UTC, sentence 0.2 s after its PPS
+        lines = []
+        for i in range(seconds):
             body = f'GPZDA,0000{i:02d}.00,09,09,2026,00,00'
             checksum = 0
             for ch in body:
                 checksum ^= ord(ch)
-            lines += [f'P,{i+1},{(i+1)*hz}', f'Z,{i+1},{(i+1)*hz+hz//5},${body}*{checksum:02X}']
-        start = 11 * hz
-        lines += [f'T,1,0,1,{start-750}', f'T,2,0,0,{start+3000}',
-                  f'S,1,0,1,{start}', f'S,2,0,0,{start+750075}',
-                  f'S,3,0,1,{25*hz}', f'S,4,0,0,{27*hz}',
-                  '#HFINAL ppsdrops=0 todtrunc=0 tdrops=0 sdrops=0 host=0 skip=0 stall=0',
-                  '#SESSION,STOP,test']
+            lines += [f'P,{i + 1},{(i + 1) * hz}', f'Z,{i + 1},{(i + 1) * hz + hz // 5},${body}*{checksum:02X}']
+        return lines
+
+    def run_postprocess(self, lines, *options, edges=False):
         with tempfile.TemporaryDirectory() as folder:
-            log = Path(folder) / 'run.log'; out = Path(folder) / 'frames.csv'
+            log = Path(folder) / 'run.log';
+            out = Path(folder) / 'frames.csv'
+            edge_csv = Path(folder) / 'edges.csv'
             log.write_text('\n'.join(lines) + '\n')
-            subprocess.run([sys.executable, str(ROOT / 'postprocess.py'), str(log), '-o', str(out),
-                            '--tod-scale', 'utc', '--convention', 'preceding'], check=True,
-                           capture_output=True, text=True)
-            with out.open() as f:
-                frames = list(csv.DictReader(f))
-            self.assertEqual(frames[0]['dur_us'], '10000.000')
-            delta_ns = ((int(frames[0]['end_sec']) - int(frames[0]['start_sec'])) * 10**9 +
-                        int(frames[0]['end_ns']) - int(frames[0]['start_ns']))
-            self.assertEqual(delta_ns, 10_000_000)
-            self.assertEqual(frames[1]['dur_us'], '')
-            self.assertTrue(int(frames[1]['flags']) & 1)
+            result = subprocess.run([sys.executable, str(ROOT / 'postprocess.py'), str(log), '-o', str(out),
+                                     *(('--edges', str(edge_csv)) if edges else ()), *options],
+                                    capture_output=True, text=True)
+            tables = []
+            for path in (out, edge_csv):
+                if path.exists():
+                    with path.open() as f:
+                        tables.append(list(csv.DictReader(f)))
+                else:
+                    tables.append([])
+        return result, tables[0], tables[1]
+
+    def test_csv_duration_uses_calibrated_time_and_blanks_failed_fit(self):
+        hz = 75_007_500  # +100 ppm versus nominal
+        start = 11 * hz
+        lines = self.HEADER + self.gnss_lines(hz) + [
+            f'T,1,0,1,{start - 750}', f'T,2,0,0,{start + 3000}',
+            f'S,1,0,1,{start}', f'S,2,0,0,{start + 750075}',
+            f'S,3,0,1,{25 * hz}', f'S,4,0,0,{27 * hz}'] + self.FOOTER
+        result, frames, _ = self.run_postprocess(lines, '--convention', 'preceding')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(frames[0]['dur_us'], '10000.000')
+        delta_ns = ((int(frames[0]['end_utc_sec']) - int(frames[0]['start_utc_sec'])) * 10 ** 9 +
+                    int(frames[0]['end_ns']) - int(frames[0]['start_ns']))
+        self.assertEqual(delta_ns, 10_000_000)
+        self.assertEqual(frames[1]['dur_us'], '')
+        self.assertTrue(int(frames[1]['flags']) & 1)
+
+    def test_csv_carries_utc_and_gps_seconds(self):
+        hz = 75_000_000
+        start = 11 * hz  # PPS 11 = 2026-09-09 00:00:10 UTC
+        lines = self.HEADER + self.gnss_lines(hz) + [
+            f'T,1,0,1,{start - 750}', f'T,2,0,0,{start + 3000}',
+            f'S,1,0,1,{start}', f'S,2,0,0,{start + 750000}'] + self.FOOTER
+        utc = calendar.timegm((2026, 9, 9, 0, 0, 10))
+        for options, leap in (((), 18), (('--leap', '19'), 19)):
+            result, frames, edges = self.run_postprocess(lines, '--convention', 'preceding', *options, edges=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            frame = frames[0]
+            self.assertEqual((frame['start_utc_sec'], frame['start_ns']), (str(utc), '000000000'))
+            for key in ('start', 'end', 'mid', 'trig'):
+                self.assertEqual(int(frame[f'{key}_gps_sec']) - int(frame[f'{key}_utc_sec']),
+                                 leap - pp.GPS_EPOCH_UNIX)
+            self.assertEqual((frame['time_base'], frame['pps_convention'], frame['leap_seconds']),
+                             ('gnss', 'preceding', str(leap)))
+            self.assertFalse(int(frame['flags']) & 0x20)
+            for column in ('output_time_scale', 'tod_scale', 'start_sec'):
+                self.assertNotIn(column, frame)
+            strobe = next(e for e in edges if e['kind'] == 'S' and e['level'] == '1')
+            self.assertEqual((strobe['utc_sec'], strobe['gps_sec'], strobe['ns'], strobe['time_base']),
+                             (str(utc), str(utc + leap - pp.GPS_EPOCH_UNIX), '000000000', 'gnss'))
+
+    def test_removed_options_are_rejected(self):
+        for options in (('--tod-scale', 'utc'), ('--gps',)):
+            result, _, _ = self.run_postprocess(self.HEADER + self.FOOTER, *options)
+            self.assertEqual(result.returncode, 2)
+
+    def test_convention_is_required_only_with_pps_and_tod(self):
+        result, frames, _ = self.run_postprocess(self.HEADER + self.gnss_lines(75_000_000) + self.FOOTER)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('--convention', result.stderr)
+        self.assertEqual(frames, [])
+
+    def test_missing_pps_and_tod_free_runs_from_gps_epoch(self):
+        hz = 75_000_000
+        first = 123 * hz + 4567
+        lines = list(self.HEADER)
+        for k in range(51):  # 50 Hz: frame 50 lands exactly 1 s after the first trigger
+            trig = first + k * (hz // 50)
+            lines += [f'T,{2 * k + 1},0,1,{trig}', f'T,{2 * k + 2},0,0,{trig + 3750}',
+                      f'S,{2 * k + 1},0,1,{trig + 7500}', f'S,{2 * k + 2},0,0,{trig + 7500 + 750000}']
+        result, frames, edges = self.run_postprocess(lines + self.FOOTER, edges=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('FREE-RUN', result.stderr)
+        self.assertEqual(len(frames), 51)
+        head = frames[0]
+        self.assertEqual((head['trig_utc_sec'], head['trig_gps_sec'], head['trig_ns']),
+                         (str(pp.GPS_EPOCH_UNIX), '0', '000000000'))
+        self.assertEqual((head['start_gps_sec'], head['start_ns']), ('0', '000100000'))
+        self.assertEqual((head['end_gps_sec'], head['end_ns']), ('0', '010100000'))
+        self.assertEqual((head['mid_gps_sec'], head['mid_ns']), ('0', '005100000'))
+        self.assertEqual((head['dur_us'], head['latency_us']), ('10000.000', '100.000'))
+        self.assertEqual((head['fit_rms_ns'], head['n_anchors']), ('', '0'))
+        tail = frames[50]
+        self.assertEqual((tail['trig_utc_sec'], tail['trig_gps_sec'], tail['trig_ns']),
+                         (str(pp.GPS_EPOCH_UNIX + 1), '1', '000000000'))
+        for frame in frames:
+            self.assertEqual(int(frame['flags']), 0x20)
+            self.assertEqual((frame['time_base'], frame['pps_convention'], frame['leap_seconds']),
+                             ('free_run', '', '0'))
+        self.assertEqual((edges[0]['utc_sec'], edges[0]['gps_sec'], edges[0]['ns'], edges[0]['time_base']),
+                         (str(pp.GPS_EPOCH_UNIX), '0', '000000000', 'free_run'))
+
+    def test_too_few_anchors_free_runs_instead_of_aborting(self):
+        hz = 75_000_000
+        lines = self.HEADER + self.gnss_lines(hz, seconds=3) + [
+            f'T,1,0,1,{2 * hz}', f'T,2,0,0,{2 * hz + 3750}',
+            f'S,1,0,1,{2 * hz + 7500}', f'S,2,0,0,{2 * hz + 757500}'] + self.FOOTER
+        result, frames, _ = self.run_postprocess(lines, '--convention', 'preceding')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('check PPS/ToD wiring', result.stderr)
+        self.assertEqual((frames[0]['trig_gps_sec'], frames[0]['trig_ns'], frames[0]['time_base']),
+                         ('0', '000000000', 'free_run'))
+
+    def test_strobe_polarity_override_recovers_active_low_exposure(self):
+        hz = 75_000_000
+        lines = list(self.HEADER)  # header declares ah=1
+        for k in range(3):  # 50 Hz; line sinks low for 5 ms, 100 us after each trigger
+            trig = 5 * hz + k * (hz // 50)
+            lines += [f'T,{2 * k + 1},0,1,{trig}', f'T,{2 * k + 2},0,0,{trig + 3750}',
+                      f'S,{2 * k + 1},0,0,{trig + 7500}', f'S,{2 * k + 2},0,1,{trig + 7500 + 375000}']
+        lines += self.FOOTER
+        result, frames, _ = self.run_postprocess(lines, '--strobe-ah', '0:0')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('polarity override', result.stderr)
+        self.assertEqual([(f['dur_us'], f['latency_us'], f['strobe_active_high'], f['flags']) for f in frames],
+                         [('5000.000', '100.000', '0', '32')] * 3)
+        _, frames, _ = self.run_postprocess(lines)  # header polarity: high phase taken as exposure
+        self.assertEqual((frames[0]['dur_us'], frames[0]['latency_us'], frames[0]['strobe_active_high']),
+                         ('15000.000', '5100.000', '1'))
+        for bad in ('0:2', '0', '9:0'):
+            self.assertEqual(self.run_postprocess(lines, '--strobe-ah', bad)[0].returncode, 2)
+
+    def test_free_run_clock_origin_and_earlier_edges(self):
+        hz = 75_000_000
+        clock = pp.FreeRunClock(1000, hz)
+        self.assertEqual(clock.gnss(1000), (pp.GPS_EPOCH_UNIX, 0.0, 0.0, 0, True, False))
+        whole, frac = clock.gnss(1000 + 90 * 60 * hz + 75)[:2]  # 1.5 h + 1 us
+        self.assertEqual(whole, pp.GPS_EPOCH_UNIX + 5400)
+        self.assertAlmostEqual(frac, 1e-6, delta=1e-10)
+        whole, frac = clock.gnss(1000 - 75)[:2]  # 1 us before the origin
+        self.assertEqual(whole, pp.GPS_EPOCH_UNIX - 1)
+        self.assertAlmostEqual(frac, 1 - 1e-6, delta=1e-10)
+
+    def test_free_run_origin_is_first_active_trigger_edge(self):
+        lg = pp.Log()
+        lg.trig_cfg = {0: dict(active_high=1), 2: dict(active_high=0)}
+        lg.trig = {0: [(2, 0, 50), (3, 1, 900)], 2: [(1, 1, 40), (2, 0, 700)]}
+        lg.strobe = {0: [(1, 1, 10)]}
+        self.assertEqual(pp.first_trigger_tick(lg), 700)
+        lg.trig = {0: [(2, 0, 50)]}
+        self.assertEqual(pp.first_trigger_tick(lg), 10)  # no active-going trigger: earliest edge
+        self.assertIsNone(pp.first_trigger_tick(pp.Log()))
 
 
 class FakeBoard:

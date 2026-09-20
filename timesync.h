@@ -21,22 +21,22 @@ namespace timesync {
 	// one raw NMEA sentence, assembled in loop() context
 	struct TodMsg {
 		uint32_t seq;
-		uint64_t tick;	// timebase tick at the terminator read-out
-		char nmea[100];	// "$...*CS", no CR/LF, null-terminated
+		uint64_t tick;	 // timebase tick at the terminator read-out
+		char nmea[100];	 // "$...*CS", no CR/LF, null-terminated
 	};
 	// reads available TOD_INPUT_SERIAL bytes; true when a full sentence is ready;
 	// call repeatedly until false
 	bool readTod(TodMsg &out);
 
 	// health (monotonic within a session)
-	uint32_t ppsRawCount();		   // PPS edges seen (== last seq, incl. dropped)
-	uint32_t ppsDrops();		   // PPS ring overflow drops
-	uint32_t todCount();		   // sentences completed
-	uint32_t todBytes();		   // raw bytes read
-	uint32_t todTruncated();	   // oversize sentences discarded
-	double lastPpsIntervalSec();   // last inter-PPS gap (0 until 2 edges seen)
+	uint32_t ppsRawCount();		  // PPS edges seen (== last seq, incl. dropped)
+	uint32_t ppsDrops();		  // PPS ring overflow drops
+	uint32_t todCount();		  // sentences completed
+	uint32_t todBytes();		  // raw bytes read
+	uint32_t todTruncated();	  // oversize sentences discarded
+	double lastPpsIntervalSec();  // last inter-PPS gap (0 until 2 edges seen)
 
-	void resetStats();	 // full reset (counters + ring + assembly); only while paused
-	void flushInput();	 // drop buffered ToD bytes -> clean session start
+	void resetStats();			  // full reset (counters + ring + assembly); only while paused
+	void flushInput();			  // drop buffered ToD bytes -> clean session start
 
 }  // namespace timesync
