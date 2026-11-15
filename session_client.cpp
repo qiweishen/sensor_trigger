@@ -1,47 +1,23 @@
-// session_client.cpp - reference host client for the SensorSync-Logger session API.
+// session_client.cpp - host recorder for SensorSync-Logger
 //
-// Usage from an acquisition driver:
-//     SensorSyncSession s;
-//     s.open("/dev/serial/by-id/usb-Teensyduino_...");   // by-id survives re-enumeration
-//     s.start("/data/logs/run_0007.log",                 // one file per run, counts from 0
-//             {{0, 25.0}, {2, 2.0}});                    // FX pair at 25 Hz, JAI pair at 2 Hz
-//     ... acquisition ...
-//     s.stop();                                          // board -> idle, counts cleared
+//   SensorSyncSession s;
+//   s.open("/dev/serial/by-id/usb-Teensyduino_...");     // stops any running session
+//   s.start("/data/run_0007.log", {{0, 25.0}, {2, 2.0}});  // channel -> Hz; 0/1 = FX pair, 2/3 = JAI pair
+//   ... acquisition; poll s.ok() ...
+//   s.stop();
 //
-// Protocol v2: channels 0/1 share FX, channels 2/3 share JAI. {ch, 0} disables
-// its whole pair; omitted groups retain their rate. Conflicting pair requests
-// fail before sending START. The wire command uses "freq=FX:25,JAI:2" and the
-// board echoes requested/actual rates in #GROUP and #TRIG. #ERR,bad_freq rejects
-// the whole request. #READY, after successful hardware start, acknowledges it.
+// The reader thread copies every board byte into the log file.
+// ok() turns false on a port/file error, a #ERR line, or #H drops != 0.
 //
-// open() configures raw/no-echo, terminates any residual command, stops the board,
-// and verifies a fresh round trip followed by idle. Call it BEFORE camera arming.
-// startupLog() retains the bounded pre-session transcript separately from data.
-// start() opens <path>, flushes stale idle input, sends "START <path>", and spawns
-// a reader thread that copies the serial stream into the file until stop().
-// The board cannot write the host filesystem: <path> is echoed into the log's
-// "#SESSION,START,<path>" line; this client does the file I/O.
-//
-// A port drop, unexpected #IDLE, repeated START, #ERR or reported event loss
-// latches an integrity failure. The caller must end this camera/time epoch;
-// an automatic board restart would destroy the original frame association.
-//
-// Protocol (newline-terminated, 115200 8N1 - do not change the baud):
-//   host -> board:  "START [freq=FX:<hz>,JAI:<hz>] [path]" | "STOP" | "s" (status) | "h" (header)
-//   board -> host:  "#SESSION,START,<path>", v2 header, #READY, P/T/S/Z data + "#H" health,
-//                   "#HFINAL ...", "#SESSION,STOP,<path>"; "#IDLE,up=<ms>" while idle
-//
-// Build demo:  g++ -std=c++20 -O2 -pthread -DSESSION_CLIENT_DEMO session_client.cpp -o session_client
-// Run demo:    ./session_client /dev/ttyACM0 /tmp/run.log 5 25    (FX pair at 25 Hz)
+// Include this file in an application, or build the command-line recorder:
+//   g++ -std=c++17 -O2 -pthread -DSESSION_CLIENT_DEMO session_client.cpp -o session_client
+//   ./session_client <port> <log> [seconds, 0 = until Ctrl-C] [FX_hz | freq=FX:hz,JAI:hz]
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
-#include <climits>
-#include <cmath>
-#include <csignal>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <mutex>
@@ -53,520 +29,260 @@
 #include <utility>
 #include <vector>
 
-#include "session_protocol.h"
-#include "session_rates.h"
 
 class SensorSyncSession {
 public:
 	~SensorSyncSession() {
 		stop();
-		if (out_)
-			::fclose(out_);	 // also covers an allocation exception during start()
-		std::lock_guard<std::mutex> lk(io_mtx_);
-		closePortLocked();
+		if (fd_ >= 0) {
+			::close(fd_);
+		}
 	}
 
-	// Open, configure raw 115200 8N1, and synchronize to idle before camera arming.
-	// This sends STOP; the caller must own the board, with no other serial clients.
-	// prefer a /dev/serial/by-id/ path: it survives USB re-enumeration.
+	// raw 115200 8N1 (USB CDC: nominal); STOP clears a session left running
 	bool open(const char *port) {
-		std::lock_guard<std::mutex> lk(io_mtx_);
-		if (running_)
-			return fail("cannot reopen a running session", EBUSY);
-		startup_log_.clear();
-		last_error_.clear();
-		port_path_ = port;
-		closePortLocked();
-		return openPortLocked();
+		if (fd_ >= 0) {
+			::close(fd_);
+		}
+		fd_ = ::open(port, O_RDWR | O_NOCTTY | O_CLOEXEC);
+		if (fd_ < 0) {
+			return fail(std::string("open ") + port, errno);
+		}
+		termios tio{};
+		::tcgetattr(fd_, &tio);
+		::cfmakeraw(&tio);
+		::cfsetspeed(&tio, B115200);
+		::tcsetattr(fd_, TCSANOW, &tio);
+		send("\nSTOP\n");
+		startup_log_ = readFor(std::chrono::milliseconds(500));	 // board replies, old session tail
+		return true;
 	}
 
-	// begin a run: fresh counts from 0, stream captured to `path`.
-	// freqs: physical channel requests, collapsed into FX/JAI pairs on the wire.
-	// {ch, 0} disables its pair; empty retains both groups' previous rates.
 	bool start(const std::string &path, const std::vector<std::pair<int, double>> &freqs = {}) {
-		last_error_.clear();
+		std::string spec;
+		if (fd_ < 0) {
+			return fail("port not open");
+		}
 		if (running_) {
-			return fail("session already running", EBUSY);
+			return fail("already recording");
 		}
-		if (path.size() > 223 || path.find_first_of("\r\n") != std::string::npos || path.find('\0') != std::string::npos)
-			return fail("invalid session path", EINVAL);
-		std::string rate_error;
-		if (!sensorsync::BuildFrequencySpec(freqs, freq_spec_, rate_error))
-			return fail(rate_error, EINVAL);
-		const int log_fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
-		if (log_fd < 0)
-			return fail("create timing log", errno);
-		out_ = ::fdopen(log_fd, "wb");
+		if (!rateSpec(freqs, spec)) {
+			return false;
+		}
+		out_ = std::fopen(path.c_str(), "wx");	// never overwrite a log
 		if (!out_) {
-			const int err = errno;
-			::close(log_fd);
-			return fail("open timing log stream", err);
+			return fail("create " + path, errno);
 		}
-		session_path_ = path;
-		{
-			std::lock_guard<std::mutex> lk(io_mtx_);
-			if (fd_ < 0) {
-				::fclose(out_);
-				out_ = nullptr;
-				return fail("serial port is not open", EBADF);
-			}
-			// stale #IDLE lines buffered since open() must not precede #SESSION,START
-			if (tcflush(fd_, TCIFLUSH) != 0) {
-				const int err = errno;
-				::fclose(out_);
-				out_ = nullptr;
-				return fail("flush idle input before START", err);
-			}
-			if (!sendStartLocked()) {
-				const int err = errno;
-				writeCommandLocked("STOP\n");  // best effort after an ambiguous/partial START write
-				::fclose(out_);
-				out_ = nullptr;
-				return fail("send START command", err);
-			}
-		}
-		write_error_ = false;
-		protocol_error_ = false;
-		start_ack_ = false;
-		stop_ack_ = false;
-		protocol_ = {};
-		protocol_detail_.clear();
-		line_len_ = 0;
-		stopping_ = false;
+		ready_ = stopped_ = failed_ = false;
+		::tcflush(fd_, TCIFLUSH);
 		running_ = true;
-		try {
-			reader_ = std::thread(&SensorSyncSession::readerLoop, this);
-		} catch (...) {
-			stop();	 // even a thread-creation failure must stop pulses already requested
-			return fail("create serial reader thread");
-		}
-		const auto deadline = Clock::now() + std::chrono::seconds(3);
-		while (!start_ack_ && ok() && Clock::now() < deadline) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(10));
-		}
-		if (!start_ack_ || !ok()) {
-			const bool missing_ack = !start_ack_;
-			protocol_error_ = true;
+		reader_ = std::thread(&SensorSyncSession::readLoop, this);
+		send("START " + (spec.empty() ? "" : "freq=" + spec + " ") + path + "\n");
+		if (!waitFor(ready_)) {
+			if (!failed_) {
+				fail("no #READY from board");
+			}
 			stop();
-			// The reader is joined: its first protocol failure is safe to inspect.
-			if (protocol_detail_.starts_with("#ERR"))
-				return fail("START rejected (freq=" + freq_spec_ + "): " + protocol_detail_, EPROTO);
-			if (!missing_ack && !protocol_detail_.empty())
-				return fail("START rejected: " + protocol_detail_, EPROTO);
-			return fail(missing_ack ? "START #READY acknowledgement missing (SensorSync protocol v2 required; see timing log)"
-									: "START serial/log integrity failure (see timing log)");
+			return false;
 		}
 		return true;
 	}
 
-	// end the run: board -> idle; drain the tail, close the file
 	void stop() {
 		if (!running_) {
 			return;
 		}
-		stopping_ = true;  // post-STOP "#IDLE" is expected
-		{
-			std::lock_guard<std::mutex> lk(io_mtx_);
-			if (fd_ >= 0) {
-				const char *cmd = "STOP\n";
-				if (!writeCommandLocked(cmd))
-					protocol_error_ = true;
-			} else {
-				protocol_error_ = true;
-			}
+		send("STOP\n");
+		if (!waitFor(stopped_)) {
+			fail("no #SESSION,STOP from board");
 		}
-		// let "#SESSION,STOP" land in the file before tearing the reader down
-		const auto deadline = Clock::now() + std::chrono::seconds(5);  // exposure tail + final queue/health drain
-		while (!stop_ack_ && !write_error_ && Clock::now() < deadline) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(10));
-		}
-		if (!stop_ack_)
-			protocol_error_ = true;
 		running_ = false;
-		if (reader_.joinable()) {
-			reader_.join();
+		reader_.join();
+		if (std::fflush(out_) != 0 || ::fsync(::fileno(out_)) != 0 || std::fclose(out_) != 0) {
+			fail("write log", errno);
 		}
-		if (out_) {
-			if (::fflush(out_) != 0 || ::fdatasync(::fileno(out_)) != 0)
-				write_error_ = true;
-			if (::fclose(out_) != 0)
-				write_error_ = true;
-			out_ = nullptr;
-		}
+		out_ = nullptr;
 	}
 
-	bool ok() const { return !write_error_ && !protocol_error_; }
+	bool ok() const { return !failed_; }
 
-	// Diagnostics for failed open()/start(); inspect after the call returns.
 	int lastErrno() const { return last_errno_; }
-	const std::string &lastError() const { return last_error_; }
-	// Raw synchronization replies, bounded to 64 KiB. Retain in the application's
-	// diagnostic log, not in the subsequent timing data file.
-	const std::string &startupLog() const { return startup_log_; }
+
+	std::string lastError() const {
+		std::lock_guard<std::mutex> lock(mutex_);
+		return last_error_;
+	}
+
+	const std::string &startupLog() const { return startup_log_; }	// replies to open(), not log data
 
 private:
-	using Clock = std::chrono::steady_clock;
-
-	bool fail(std::string_view reason, int err = 0) {
-		last_errno_ = err;
-		last_error_ = reason;
-		if (err)
-			last_error_ += ": " + std::string(std::strerror(err));
+	bool fail(const std::string &why, int err = 0) {
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (!failed_) {	 // keep the first cause
+			last_errno_ = err;
+			last_error_ = err ? why + ": " + std::strerror(err) : why;
+		}
+		failed_ = true;
 		return false;
 	}
 
-	// --- port lifecycle (io_mtx_ held) ---------------------------------------
-	void closePortLocked() {
-		if (fd_ >= 0) {
-			::close(fd_);
-			fd_ = -1;
+	void send(const std::string &text) {
+		if (::write(fd_, text.data(), text.size()) != ssize_t(text.size())) {
+			fail("serial write", errno);
 		}
 	}
 
-	bool openPortLocked() {
-		fd_ = ::open(port_path_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
-		if (fd_ < 0) {
-			return fail("open serial port", errno);
+	// group rates on the wire; both channels of a pair must agree
+	bool rateSpec(const std::vector<std::pair<int, double>> &freqs, std::string &spec) {
+		double hz[2] = {};
+		bool set[2] = {};
+		for (const auto &[ch, f]: freqs) {
+			if (ch < 0 || ch > 3) {
+				return fail("trigger channel must be 0..3");
+			}
+			if (set[ch / 2] && hz[ch / 2] != f) {
+				return fail("conflicting rates within a trigger pair");
+			}
+			hz[ch / 2] = f;
+			set[ch / 2] = true;
 		}
-		termios tio{};
-		if (tcgetattr(fd_, &tio) != 0) {
-			const int err = errno;
-			closePortLocked();
-			return fail("read serial settings", err);
-		}
-		cfmakeraw(&tio);
-		tio.c_cflag &= ~CSTOPB;
-#ifdef CRTSCTS
-		tio.c_cflag &= ~CRTSCTS;
-#endif
-		cfsetispeed(&tio, B115200);
-		cfsetospeed(&tio, B115200);
-		tio.c_cflag |= (CLOCAL | CREAD);
-		tio.c_cc[VMIN] = 0;
-		tio.c_cc[VTIME] = 1;  // 0.1 s read timeout -> reader can poll running_
-		// Disable echo BEFORE clearing queued echo bytes or sending anything.
-		// Keep O_NONBLOCK during startup so reads and writes obey its deadline.
-		if (tcsetattr(fd_, TCSANOW, &tio) != 0) {
-			const int err = errno;
-			closePortLocked();
-			return fail("apply raw serial settings", err);
-		}
-		if (!synchronizeLocked()) {
-			closePortLocked();
-			return false;
-		}
-		// Normal recording uses VMIN/VTIME for the existing reader's EOF checks.
-		if (fcntl(fd_, F_SETFL, 0) != 0) {
-			const int err = errno;
-			closePortLocked();
-			return fail("enable timed serial reads", err);
-		}
-		last_errno_ = 0;
+		for (int g = 0; g < 2; ++g)
+			if (set[g]) {
+				char item[48];
+				std::snprintf(item, sizeof(item), "%s%s:%.17g", spec.empty() ? "" : ",", g ? "JAI" : "FX", hz[g]);
+				spec += item;
+			}
 		return true;
 	}
 
-	bool waitStartupIoLocked(short events, Clock::time_point deadline) {
-		while (Clock::now() < deadline) {
-			pollfd pfd{ fd_, events, 0 };
-			const int ready = ::poll(&pfd, 1, 100);
-			if (ready < 0) {
-				if (errno == EINTR)
-					continue;
-				return fail("startup serial poll", errno);
-			}
-			if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
-				return fail("serial port lost during startup synchronization", EIO);
-			if (pfd.revents & events)
-				return true;
-		}
-		return fail("startup synchronization timed out waiting for barrier/idle", ETIMEDOUT);
-	}
-
-	bool synchronizeLocked() {
-		// This clears host queues, not the firmware's persistent cmd[]/cmdlen.
-		if (tcflush(fd_, TCIOFLUSH) != 0)
-			return fail("flush startup serial queues", errno);
-		static std::atomic<unsigned long long> sequence{ 0 };
-		const std::string marker = "__SENSORSYNC_SYNC_" + std::to_string(::getpid()) + "_" +
-								   std::to_string(Clock::now().time_since_epoch().count()) + "_" + std::to_string(++sequence);
-		const std::string barrier_reply = "#ERR,unknown_command," + marker;
-		const std::string completion_reply = barrier_reply + "_DONE";
-		SensorSyncStartupProtocol startup{ barrier_reply, completion_reply };
-		// Terminate the residual line, then stop any old session. The fresh marker
-		// proves earlier commands/replies were processed; status must report idle.
-		// A second marker confirms the status command was consumed, even if an
-		// idle heartbeat preceded its reply. Never request START in this phase.
-		const std::string commands = "\nSTOP\n" + marker + "\ns\n" + marker + "_DONE\n";
-		const auto deadline = Clock::now() + std::chrono::seconds(3);
-		std::size_t sent = 0;
-		while (sent < commands.size()) {
-			if (!waitStartupIoLocked(POLLOUT, deadline))
-				return false;
-			const ssize_t n = ::write(fd_, commands.data() + sent, commands.size() - sent);
-			if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
-				continue;
-			if (n <= 0)
-				return fail("write startup synchronization commands", n < 0 ? errno : EIO);
-			sent += static_cast<std::size_t>(n);
-		}
-
-		char buf[512], line[2048];
-		std::size_t line_len = 0;
-		for (;;) {
-			if (!waitStartupIoLocked(POLLIN, deadline))
-				return false;
-			const ssize_t n = ::read(fd_, buf, sizeof(buf));
-			if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
-				continue;
-			if (n <= 0)
-				return fail("read startup synchronization replies", n < 0 ? errno : EIO);
-			const auto size = static_cast<std::size_t>(n);
-			if (startup_log_.size() + size > 64 * 1024)
-				return fail("startup synchronization exceeded 64 KiB diagnostic limit", EOVERFLOW);
-			startup_log_.append(buf, size);
-			for (std::size_t i = 0; i < size; ++i) {
-				if (buf[i] == '\n') {
-					// Wait for LF even when CRLF is split across reads: a leftover
-					// LF must not become the first byte of the capture log.
-					std::string_view reply(line, line_len);
-					if (reply.ends_with('\r'))
-						reply.remove_suffix(1);
-					startup.observe(reply);
-					if (startup.failed)
-						return fail("unexpected reply after startup barrier: " + std::string(reply), EPROTO);
-					line_len = 0;
-				} else if (line_len < sizeof(line)) {
-					line[line_len++] = buf[i];
-				} else {
-					return fail("startup reply exceeds 2048-byte line limit", EOVERFLOW);
+	std::string readFor(std::chrono::milliseconds span) {
+		std::string text;
+		char buf[4096];
+		const auto end = std::chrono::steady_clock::now() + span;
+		while (std::chrono::steady_clock::now() < end) {
+			pollfd p{ fd_, POLLIN, 0 };
+			if (::poll(&p, 1, 20) > 0) {
+				const ssize_t n = ::read(fd_, buf, sizeof(buf));
+				if (n > 0) {
+					text.append(buf, n);
 				}
 			}
-			// Process the whole read, including any fragmented trailing reply.
-			if (startup.completed && line_len == 0)
-				return true;
 		}
+		return text;
 	}
 
-	bool sendStartLocked() {
-		// Board command storage is bounded; never allow silent truncation of its identity.
-		std::string cmd = "START ";
-		if (!freq_spec_.empty()) {
-			cmd += "freq=" + freq_spec_ + " ";
+	bool waitFor(const std::atomic<bool> &flag) {
+		const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+		while (!flag && !failed_ && std::chrono::steady_clock::now() < end) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		}
-		cmd += session_path_ + "\n";
-		if (cmd.size() > 255) {
-			errno = EMSGSIZE;
-			return false;
-		}
-		return writeCommandLocked(cmd);
+		return flag;
 	}
 
-	bool writeCommandLocked(const std::string &cmd) {
-		if (fd_ < 0) {
-			errno = EBADF;
-			return false;
-		}
-		std::size_t sent = 0;
-		while (sent < cmd.size()) {
-			const ssize_t n = ::write(fd_, cmd.data() + sent, cmd.size() - sent);
-			if (n < 0 && errno == EINTR)
-				continue;
-			if (n <= 0) {
-				if (n == 0)
-					errno = EIO;
-				return false;
-			}
-			sent += static_cast<std::size_t>(n);
-		}
-		return true;
-	}
-
-	// --- reader thread -------------------------------------------------------
-	void readerLoop() {
-		char buf[512];
-		int fast_zero = 0;	// EOF detector: real VTIME timeouts take ~100 ms
+	void readLoop() {
+		std::string line;
+		char buf[4096];
 		while (running_) {
-			int fd;
-			{
-				std::lock_guard<std::mutex> lk(io_mtx_);
-				fd = fd_;
+			pollfd p{ fd_, POLLIN, 0 };
+			if (::poll(&p, 1, 50) <= 0) {
+				continue;
 			}
-			if (fd < 0) {
-				protocol_error_ = true;
-				break;	// a new clock epoch must not be silently joined to this recording
+			const ssize_t n = ::read(fd_, buf, sizeof(buf));
+			if (n <= 0) {
+				fail("serial port lost", n < 0 ? errno : 0);
+				return;
 			}
-			const auto t0 = Clock::now();
-			const ssize_t n = ::read(fd, buf, sizeof(buf));
-			if (n > 0) {
-				fast_zero = 0;
-				if (::fwrite(buf, 1, static_cast<std::size_t>(n), out_) != static_cast<std::size_t>(n) || ::fflush(out_) != 0) {
-					write_error_ = true;
-					break;
-				}
-				scanStream(buf, static_cast<size_t>(n));
-			} else if (n < 0) {
-				if (errno == EINTR) {
-					continue;
-				}
-				// Unplug/reboot ends this epoch; never reopen into the same timing log.
-				std::lock_guard<std::mutex> lk(io_mtx_);
-				closePortLocked();
-				protocol_error_ = true;
-			} else {						  // n == 0: VTIME timeout - or EOF, which returns instantly
-				if (Clock::now() - t0 < std::chrono::milliseconds(20)) {
-					if (++fast_zero >= 20) {  // sustained instant EOF = dead port
-						fast_zero = 0;
-						std::lock_guard<std::mutex> lk(io_mtx_);
-						closePortLocked();
-						protocol_error_ = true;
-					}
-				} else {
-					fast_zero = 0;
+			if (std::fwrite(buf, 1, n, out_) != size_t(n)) {
+				fail("write log", errno);
+			}
+			for (ssize_t i = 0; i < n; ++i) {
+				if (buf[i] == '\n') {
+					onLine(line);
+					line.clear();
+				} else if (buf[i] != '\r') {
+					line += buf[i];
 				}
 			}
 		}
 	}
 
-	// Check acknowledgements, final counters and epoch continuity in complete lines.
-	void scanStream(const char *buf, size_t n) {
-		for (size_t i = 0; i < n; i++) {
-			const char c = buf[i];
-			if (c == '\n' || c == '\r') {
-				const std::string_view line(line_, line_len_);
-				bool bad_line = false;
-				for (const std::string_view prefix: { "#SESSION,START,", "#SESSION,STOP," }) {
-					if (line.starts_with(prefix) && line.substr(prefix.size()) != session_path_)
-						bad_line = true;
-				}
-				const bool already_failed = protocol_.failed;
-				protocol_.observe(line, stopping_.load());
-				bad_line = bad_line || (!already_failed && protocol_.failed);
-				if (bad_line) {
-					protocol_error_ = true;
-					if (protocol_detail_.empty())
-						protocol_detail_ = std::string(line);
-				}
-				if (protocol_.ready && !protocol_.failed)
-					start_ack_ = true;
-				if (protocol_.stop_received)
-					stop_ack_ = true;
-				line_len_ = 0;
-			} else if (line_len_ < sizeof(line_)) {
-				line_[line_len_++] = c;
-			} else {
-				protocol_error_ = true;	 // preserve bytes in the log, but never accept a truncated control record
-				if (protocol_detail_.empty())
-					protocol_detail_ = "control record exceeds 2048 bytes";
-			}
+	void onLine(const std::string &line) {
+		const auto starts = [&](const char *prefix) { return line.rfind(prefix, 0) == 0; };
+		const std::string zero = " drops=0";
+		if (line == "#READY") {
+			ready_ = true;
+		}
+		else if (starts("#SESSION,STOP,")) {
+			stopped_ = true;
+		}
+		else if (starts("#ERR")) {
+			fail("board: " + line);
+		}
+		else if (starts("#H ") && (line.size() < zero.size() || line.compare(line.size() - zero.size(), zero.size(), zero) != 0)) {
+			fail("board reported lost lines: " + line);
 		}
 	}
 
-	std::string port_path_;
-	std::string session_path_;
-	std::string freq_spec_;	 // "FX:25,JAI:2" - group overrides for this run
 	int fd_ = -1;
-	int last_errno_ = 0;
-	std::string last_error_;
-	std::string startup_log_;
-	std::string protocol_detail_;  // reader-thread-only until stop() joins it
 	std::FILE *out_ = nullptr;
 	std::thread reader_;
-	std::mutex io_mtx_;			   // guards fd_ open/close/write
-	std::atomic<bool> running_{ false };
-	std::atomic<bool> stopping_{ false };
-	std::atomic<bool> write_error_{ false };
-	std::atomic<bool> protocol_error_{ false };
-	std::atomic<bool> start_ack_{ false };
-	std::atomic<bool> stop_ack_{ false };
-	SensorSyncProtocol protocol_;  // reader-thread-only; state mirrored through atomics above
-	char line_[2048];
-	size_t line_len_ = 0;
+	std::atomic<bool> running_{ false }, ready_{ false }, stopped_{ false }, failed_{ false };
+	mutable std::mutex mutex_;
+	int last_errno_ = 0;
+	std::string last_error_, startup_log_;
 };
 
 
 #ifdef SESSION_CLIENT_DEMO
-// seconds=0 records until SIGINT/SIGTERM. Optional status file is for record_ctl.bash.
-static volatile std::sig_atomic_t g_interrupted = 0;
+	#include <csignal>
+	#include <cstdlib>
 
-static bool writeStatus(const char *path, const char *value) {
-	if (!path)
-		return true;
-	const std::string tmp = std::string(path) + ".tmp";
-	FILE *f = ::fopen(tmp.c_str(), "w");
-	if (!f)
-		return false;
-	const bool written = ::fprintf(f, "%s\n", value) > 0;
-	const bool closed = ::fclose(f) == 0;
-	return written && closed && ::rename(tmp.c_str(), path) == 0;
-}
+static volatile std::sig_atomic_t g_stop = 0;
 
-static bool parseFreqs(const char *arg, std::vector<std::pair<int, double>> &freqs) {
-	std::string spec = arg;
-	if (spec.starts_with("freq="))
+// "25" | "FX:25,JAI:2" | "freq=FX:25,JAI:2"
+static std::vector<std::pair<int, double>> parseFreqs(std::string spec) {
+	std::vector<std::pair<int, double>> freqs;
+	if (spec.rfind("freq=", 0) == 0) {
 		spec.erase(0, 5);
-	else if (!spec.starts_with("FX:") && !spec.starts_with("JAI:"))
-		spec = "FX:" + spec;
-	if (spec.empty())
-		return true;
-	trigger::Rates rates;
-	uint8_t fields = 0;
-	if (!trigger::parseRates(spec.c_str(), rates, &fields))
-		return false;
-	for (unsigned g = 0; g < trigger::GROUP_COUNT; ++g) {
-		if (fields & (1u << g))
-			freqs.emplace_back(static_cast<int>(2 * g), rates.hz[g]);
 	}
-	return true;
+	if (!spec.empty() && spec.find(':') == std::string::npos) {
+		spec = "FX:" + spec;
+	}
+	for (size_t pos = 0; pos < spec.size();) {
+		const size_t end = std::min(spec.find(',', pos), spec.size());
+		const std::string item = spec.substr(pos, end - pos);
+		const int ch = item.rfind("FX:", 0) == 0 ? 0 : item.rfind("JAI:", 0) == 0 ? 2 : -1;
+		freqs.emplace_back(ch, std::atof(item.c_str() + item.find(':') + 1));
+		pos = end + 1;
+	}
+	return freqs;
 }
 
 int main(int argc, char **argv) {
-	if (argc < 3 || argc > 6) {
-		fprintf(stderr, "usage: %s <port> <logfile> [seconds; 0=until signal] [FX_hz|freq=FX:hz,JAI:hz] [status_file]\n", argv[0]);
+	if (argc < 3) {
+		std::fprintf(stderr, "usage: %s <port> <log> [seconds, 0 = until Ctrl-C] [FX_hz | freq=FX:hz,JAI:hz]\n", argv[0]);
 		return 2;
 	}
-	const char *status_path = argc > 5 ? argv[5] : nullptr;
-	const auto fail = [&](const char *reason) {
-		fprintf(stderr, "%s\n", reason);
-		writeStatus(status_path, "FAILED");
-		return 1;
-	};
-	char *end = nullptr;
-	const long secs = argc > 3 ? strtol(argv[3], &end, 10) : 5;
-	if (secs < 0 || secs > INT_MAX || (argc > 3 && (end == argv[3] || *end)))
-		return fail("invalid duration");
-	std::vector<std::pair<int, double>> freqs;
-	if (argc > 4 && !parseFreqs(argv[4], freqs))
-		return fail("invalid frequency specification; use FX:20-or-higher,JAI:1-to-10 (0 disables a group)");
-	signal(SIGINT, [](int) { g_interrupted = 1; });
-	signal(SIGTERM, [](int) { g_interrupted = 1; });
+	const int seconds = argc > 3 ? std::atoi(argv[3]) : 0;
+	const auto freqs = parseFreqs(argc > 4 ? argv[4] : "");
+	std::signal(SIGINT, [](int) { g_stop = 1; });
+	std::signal(SIGTERM, [](int) { g_stop = 1; });
+
 	SensorSyncSession s;
-	const bool opened = s.open(argv[1]);
-	if (!s.startupLog().empty()) {
-		fprintf(stderr, "SensorSync pre-session synchronization (not capture data):\n");
-		fwrite(s.startupLog().data(), 1, s.startupLog().size(), stderr);
+	if (!s.open(argv[1]) || !s.start(argv[2], freqs)) {
+		std::fprintf(stderr, "start failed: %s\n", s.lastError().c_str());
+		return 1;
 	}
-	if (!opened) {
-		fprintf(stderr, "open/synchronize %s failed: %s\n", argv[1], s.lastError().c_str());
-		return fail("cannot prepare recording port");
-	}
-	if (!s.start(argv[2], freqs)) {
-		fprintf(stderr, "START failed: %s\n", s.lastError().c_str());
-		return fail("cannot start timing session");
-	}
-	if (!writeStatus(status_path, "RUNNING")) {
-		s.stop();
-		return fail("cannot publish recorder status");
-	}
-	const auto start = std::chrono::steady_clock::now();
-	while (!g_interrupted && s.ok() && (secs == 0 || std::chrono::steady_clock::now() - start < std::chrono::seconds(secs))) {
-		std::this_thread::sleep_for(std::chrono::milliseconds(20));
-	}
+	std::fprintf(stderr, "recording -> %s\n", argv[2]);
+	const auto t0 = std::chrono::steady_clock::now();
+	while (!g_stop && s.ok() && (seconds == 0 || std::chrono::steady_clock::now() - t0 < std::chrono::seconds(seconds)))
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
 	s.stop();
-	if (!s.ok())
-		return fail("recording failed: port, protocol, reported event loss, or log write error");
-	if (!writeStatus(status_path, "DONE"))
-		return fail("cannot publish final recorder status");
-	fprintf(stderr, "done.\n");
+	if (!s.ok()) {
+		std::fprintf(stderr, "recording failed: %s\n", s.lastError().c_str());
+		return 1;
+	}
+	std::fprintf(stderr, "done: %s\n", argv[2]);
 	return 0;
 }
 #endif
